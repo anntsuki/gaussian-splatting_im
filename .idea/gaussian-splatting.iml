@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="PYTHON_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <excludeFolder url="file://$MODULE_DIR$/SIBR_viewers/src/projects/basic" />
+      <excludeFolder url="file://$MODULE_DIR$/SIBR_viewers/src/projects/gaussianviewer" />
+      <excludeFolder url="file://$MODULE_DIR$/SIBR_viewers/src/projects/remote" />
+      <excludeFolder url="file://$MODULE_DIR$/assets" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/360_extra_scenes/bicycle/sparse" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/360_extra_scenes/bonsai/sparse" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/360_extra_scenes/counter/sparse" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/360_extra_scenes/treehill/sparse" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/360_v2/garden/sparse" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/360_v2/kitchen/sparse" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/360_v2/stump/sparse" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/charts" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/tandt_db/db/playroom/sparse" />
+      <excludeFolder url="file://$MODULE_DIR$/assets/tandt_db/tandt/train/sparse" />
+      <excludeFolder url="file://$MODULE_DIR$/output" />
+      <excludeFolder url="file://$MODULE_DIR$/submodules/diff-gaussian-rasterization/build" />
+      <excludeFolder url="file://$MODULE_DIR$/submodules/diff-gaussian-rasterization/diff_gaussian_rasterization.egg-info" />
+      <excludeFolder url="file://$MODULE_DIR$/submodules/fused-ssim/build" />
+      <excludeFolder url="file://$MODULE_DIR$/submodules/fused-ssim/fused_ssim.egg-info" />
+      <excludeFolder url="file://$MODULE_DIR$/submodules/simple-knn/build" />
+    </content>
+    <orderEntry type="jdk" jdkName="gaussian_splatting" jdkType="Python SDK" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+  <component name="PyDocumentationSettings">
+    <option name="format" value="GOOGLE" />
+    <option name="myDocStringFormat" value="Google" />
+  </component>
+</module>
