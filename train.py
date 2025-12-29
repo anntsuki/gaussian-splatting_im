@@ -185,41 +185,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # ================================================================
             # [创新点 1 最终优化版]：分级剪枝策略 (Hierarchical Pruning)
             # ================================================================
-            if iteration == opt.iterations:
+            if iteration == opt.iterations:  # 此时为 30000
                 progress_bar.close()
 
                 vis_counts = gaussians.visibility_stats
                 scales = gaussians.get_scaling.max(dim=1).values
 
-                print(f"[*] 统计数据状态: MaxVis={vis_counts.max()}, AvgScale={scales.mean():.4f}")
+                # 打印 30k 轮的统计特征
+                avg_vis = vis_counts.mean().item()
+                print(f"[*] 30k收敛统计: MaxVis={vis_counts.max()}, AvgVis={avg_vis:.1f}, AvgScale={scales.mean():.4f}")
 
-                # --- 策略 A：绝对剔除 (针对空间冗余) ---
-                # 只要被看到的次数极少，说明它对渲染几乎无贡献 (可能是遮挡后的浮点)
-                # 阈值建议：20 (非常安全的阈值)
-                mask_dead_points = (vis_counts < 20)
+                # --- 策略 A：强力去噪 (去除 30k 产生的浮点伪影) ---
+                # 哪怕个头很大，但只要极少被看到 (占比 < 2%)，就是遮挡残留
+                mask_dead = (vis_counts < 100)
 
-                # --- 策略 B：精细剔除 (针对精度冗余) ---
-                # 只有当它“既不太被看见” “又非常小” 时才删
-                # 这样保护了那些“虽然小，但是很重要(Vis高)”的纹理点
-                # 可见性阈值: 提高到 300 (接近平均值)
-                # 尺度阈值: 保持 0.01
-                mask_noise_points = (vis_counts < 300) & (scales < 0.01)
+                # --- 策略 B：高频冗余清理 (核心点云减重) ---
+                # 在 30k 时，大量点重叠在一起。如果一个点很小 (scale < 0.015) 且
+                # 关注度低于平均水平 (假设平均为 800-1000)，它就是可替换的
+                # 我们将阈值设为 600，这是一个非常安全的“去重”区间
+                mask_noise = (vis_counts < 600) & (scales < 0.015)
 
-                # [核心优化]：取并集
-                # 删掉 (绝对没用的点) + (又小又没存在感的点)
-                final_prune_mask = mask_dead_points | mask_noise_points
-
-                # 绝对剔除 0 可见性 (兜底)
-                final_prune_mask = final_prune_mask | (vis_counts == 0)
+                # [逻辑合并]：死点 | 噪声点 | 0可见点
+                final_prune_mask = mask_dead | mask_noise | (vis_counts == 0)
 
                 num_before = gaussians.get_xyz.shape[0]
                 gaussians.prune_points(final_prune_mask)
                 num_after = gaussians.get_xyz.shape[0]
 
-                print(f"[*] 分级剪枝完成: 删除了 {num_before - num_after} 个点")
-                print(f"[*] 压缩率: {(1 - num_after / num_before) * 100:.2f}%，剩余点数: {num_after}")
+                print(f"[*] 30k 剪枝完成: 删除了 {num_before - num_after} 个冗余高斯球")
+                print(f"[*] 最终点数: {num_after} (缩减率: {(1 - num_after / num_before) * 100:.2f}%)")
 
-                # 保存模型...
                 scene.save(iteration)
                 return
                 # ================================================================
