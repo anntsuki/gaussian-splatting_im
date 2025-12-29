@@ -472,45 +472,36 @@ class GaussianModel:
         self.tmp_radii = radii
 
         # =================================================================
-        # === 1. 极速瘦身模式 (Extreme Volume Reduction) ===
+        # === Precision Mode: 严控体积，放宽透明度 (Target ~175MB, High Quality) ===
         # =================================================================
 
         # [保护机制]
-        # 计算重要性 (Importance Score)
+        # 保持极低的门槛，这是画质的底线
         avg_opacity_grad = self.opacity_grad_accum / (self.opacity_grad_count + 1e-6)
         importance_score = avg_opacity_grad / (avg_opacity_grad.max() + 1e-10)
-
-        # 降低保护门槛：从 0.05 -> 0.01
-        # 只要有一点点梯度贡献，就视为“有用点”，坚决不删，保住指标。
         is_important = importance_score.squeeze() > 0.01
 
         # [尺度统计]
         scales = self.get_scaling
         max_scales = torch.max(scales, dim=1).values
         mean_scale = torch.mean(max_scales)
-        # std_scale = torch.std(max_scales) # 这一行不需要了，为了体积我们要更狠
+        # std_scale = torch.std(max_scales) # 这一行可以注释掉，这次我们直接用均值
 
-        # [激进阈值]
-        # 1. 尺度：直接用均值 (Mean)。
-        #    这意味着超过平均大小的点(约占50%)都会被审查。之前是 Mean + 1.0*Std。
+        # [策略调整]
+        # 1. 尺度：直接用均值 (Strict)
+        #    上次是 mean + 0.2*std (166MB)。这次更严，直接用 mean。
+        #    目的是把大点杀得更干净，为保留半透明点腾出空间。
         aggressive_scale_threshold = mean_scale
 
-        # 2. 不透明度：提至 0.5。
-        #    这意味着只要不是接近实心的点，都有可能被删。
-        aggressive_opacity_threshold = 0.5
+        # 2. 不透明度：降至 0.25 (Loose)
+        #    上次是 0.4 (导致掉点)。这次降回 0.25。
+        #    这意味着 0.25~0.4 之间的细节全都被“赦免”了，画质会大幅回升。
+        aggressive_opacity_threshold = 0.25
 
-        # [筛选嫌疑人]
-        # 逻辑：(体积 > 平均值) AND (不透明度 < 0.5)
+        # [筛选与裁决]
         suspect_mask = (max_scales > aggressive_scale_threshold) & (
                     self.get_opacity.squeeze() < aggressive_opacity_threshold)
-
-        # [最终裁决]
-        # 只有当它是“嫌疑人” 且 “没有被保护” 时，才删除
         prune_mask_adaptive = suspect_mask & (~is_important)
-
-        # (可选) 打印日志看删了多少，建议加上
-        # if prune_mask_adaptive.sum() > 0:
-        #    print(f"Pruning: Killed {prune_mask_adaptive.sum()} | Saved {is_important.sum()}")
 
         self.prune_points(prune_mask_adaptive)
 
