@@ -63,9 +63,10 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
 
-        # [NEW] 初始化可见性计数器
-        self.vis_count = torch.empty(0)
-        self.visibility_stats = torch.empty(0)
+        # === [Modified] 新增: 不透明度梯度累积器 ===
+        self.opacity_grad_accum = torch.empty(0)
+        self.opacity_grad_count = torch.empty(0)
+        # =========================================
 
         self.setup_functions()
 
@@ -183,9 +184,12 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        # [NEW] 训练开始时，创建一个和点数一样长的全零计数器
-        self.vis_count = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self.visibility_stats = torch.zeros(self.get_xyz.shape[0], device="cuda")
+
+        # === [Modified] 初始化累积器 ===
+        self.opacity_grad_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.opacity_grad_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        # =============================
+
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -201,21 +205,20 @@ class GaussianModel:
             try:
                 self.optimizer = SparseGaussianAdam(l, lr=0.0, eps=1e-15)
             except:
-                # A special version of the rasterizer is required to enable sparse adam
                 self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
 
         self.exposure_optimizer = torch.optim.Adam([self._exposure])
 
-        self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale,
+        self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init * self.spatial_lr_scale,
+                                                    lr_final=training_args.position_lr_final * self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
-        
-        self.exposure_scheduler_args = get_expon_lr_func(training_args.exposure_lr_init, training_args.exposure_lr_final,
-                                                        lr_delay_steps=training_args.exposure_lr_delay_steps,
-                                                        lr_delay_mult=training_args.exposure_lr_delay_mult,
-                                                        max_steps=training_args.iterations)
 
+        self.exposure_scheduler_args = get_expon_lr_func(training_args.exposure_lr_init,
+                                                         training_args.exposure_lr_final,
+                                                         lr_delay_steps=training_args.exposure_lr_delay_steps,
+                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
+                                                         max_steps=training_args.iterations)
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         if self.pretrained_exposures is None:
@@ -364,15 +367,15 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
+
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        self.tmp_radii = self.tmp_radii[valid_points_mask]
 
-        # [创新点 1] 同步剪枝可见性统计张量
-        if hasattr(self, "visibility_stats") and self.visibility_stats.shape[0] == valid_points_mask.shape[0]:
-            self.visibility_stats = self.visibility_stats[valid_points_mask]
-
-        if self.tmp_radii is not None:
-            self.tmp_radii = self.tmp_radii[valid_points_mask]
+        # === [Modified] 同步剪枝累积器 ===
+        self.opacity_grad_accum = self.opacity_grad_accum[valid_points_mask]
+        self.opacity_grad_count = self.opacity_grad_count[valid_points_mask]
+        # ==============================
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -396,14 +399,13 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                              new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
         d = {"xyz": new_xyz,
-             "f_dc": new_features_dc,
-             "f_rest": new_features_rest,
-             "opacity": new_opacities,
-             "scaling": new_scaling,
-             "rotation": new_rotation}
+        "f_dc": new_features_dc,
+        "f_rest": new_features_rest,
+        "opacity": new_opacities,
+        "scaling" : new_scaling,
+        "rotation" : new_rotation}
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -418,53 +420,43 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-        # [NEW] 新增的点，计数器初始化为 0并拼接到原计数器后面
-        self.vis_count = torch.cat((self.vis_count, torch.zeros((new_xyz.shape[0]), device="cuda")))
+        # === [Modified] 重置累积器 ===
+        self.opacity_grad_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.opacity_grad_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        # ===========================
 
-    def densify_and_split(self, grads, threshold, scene_extent):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
-        # 提取点
+        # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
-        selected_pts_mask = torch.where(padded_grad >= threshold, True, False)
-        # 使用标准比例 0.01
+        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values > 0.01 * scene_extent)
+                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
-        stds = self.get_scaling[selected_pts_mask].repeat(2, 1)
-        means = torch.zeros((stds.size(0), 3), device="cuda")
+        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
+        means =torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(2, 1, 1)
-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self._xyz[selected_pts_mask].repeat(2, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(2, 1) / (0.8 * 2))
-        new_rotation = self._rotation[selected_pts_mask].repeat(2, 1)
-        new_features_dc = self._features_dc[selected_pts_mask].repeat(2, 1, 1)
-        new_features_rest = self._features_rest[selected_pts_mask].repeat(2, 1, 1)
-        new_opacities = self._opacity[selected_pts_mask].repeat(2, 1)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
+        new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
+        new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
+        new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
-        # [修复] 提取并传递新的 tmp_radii 参数 (Split 产生双倍新点)
-        new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(2) if self.tmp_radii is not None else torch.zeros(
-            new_xyz.shape[0], device="cuda")
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
 
-        # 调用带 new_tmp_radii 的 postfix 函数
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                                   new_rotation, new_tmp_radii)
-
-        # [创新点 1] 同步处理分裂后的统计张量
-        if hasattr(self, "visibility_stats") and self.visibility_stats.shape[0] > 0:
-            extension = torch.zeros(new_xyz.shape[0], device="cuda")
-            self.visibility_stats = torch.cat([self.visibility_stats, extension], dim=0)
-
-        prune_filter = torch.cat((selected_pts_mask, torch.zeros(new_xyz.shape[0], device="cuda", dtype=bool)))
+        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, threshold, scene_extent):
-        # 提取满足梯度条件且尺度适中的点
-        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= threshold, True, False)
-        # 使用标准比例 0.01 替代可能不存在的属性
+    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+        # Extract points that satisfy the gradient condition
+        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values <= 0.01 * scene_extent)
-
+                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
@@ -472,65 +464,88 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        # [修复] 提取并传递新的 tmp_radii 参数
-        new_tmp_radii = self.tmp_radii[selected_pts_mask] if self.tmp_radii is not None else torch.zeros(
-            selected_pts_mask.sum(), device="cuda")
+        new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
-        # 调用带 new_tmp_radii 的 postfix 函数
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
-                                   new_rotation, new_tmp_radii)
-
-        # [创新点 1] 同步扩展可见性统计张量
-        if hasattr(self, "visibility_stats") and self.visibility_stats.shape[0] > 0:
-            extension = torch.zeros(selected_pts_mask.sum(), device="cuda")
-            self.visibility_stats = torch.cat([self.visibility_stats, extension], dim=0)
-
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+        self.tmp_radii = radii
+
+        # =================================================================
+        # === 1. 极速瘦身模式 (Extreme Volume Reduction) ===
+        # =================================================================
+
+        # [保护机制]
+        # 计算重要性 (Importance Score)
+        avg_opacity_grad = self.opacity_grad_accum / (self.opacity_grad_count + 1e-6)
+        importance_score = avg_opacity_grad / (avg_opacity_grad.max() + 1e-10)
+
+        # 降低保护门槛：从 0.05 -> 0.01
+        # 只要有一点点梯度贡献，就视为“有用点”，坚决不删，保住指标。
+        is_important = importance_score.squeeze() > 0.01
+
+        # [尺度统计]
+        scales = self.get_scaling
+        max_scales = torch.max(scales, dim=1).values
+        mean_scale = torch.mean(max_scales)
+        # std_scale = torch.std(max_scales) # 这一行不需要了，为了体积我们要更狠
+
+        # [激进阈值]
+        # 1. 尺度：直接用均值 (Mean)。
+        #    这意味着超过平均大小的点(约占50%)都会被审查。之前是 Mean + 1.0*Std。
+        aggressive_scale_threshold = mean_scale
+
+        # 2. 不透明度：提至 0.5。
+        #    这意味着只要不是接近实心的点，都有可能被删。
+        aggressive_opacity_threshold = 0.5
+
+        # [筛选嫌疑人]
+        # 逻辑：(体积 > 平均值) AND (不透明度 < 0.5)
+        suspect_mask = (max_scales > aggressive_scale_threshold) & (
+                    self.get_opacity.squeeze() < aggressive_opacity_threshold)
+
+        # [最终裁决]
+        # 只有当它是“嫌疑人” 且 “没有被保护” 时，才删除
+        prune_mask_adaptive = suspect_mask & (~is_important)
+
+        # (可选) 打印日志看删了多少，建议加上
+        # if prune_mask_adaptive.sum() > 0:
+        #    print(f"Pruning: Killed {prune_mask_adaptive.sum()} | Saved {is_important.sum()}")
+
+        self.prune_points(prune_mask_adaptive)
+
+        # =================================================================
+        # === 2. 标准分裂与克隆 (保持不变) ===
+        # =================================================================
+
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
-        self.tmp_radii = radii
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent)
+
+        # =================================================================
+        # === 3. 标准清理 (保持不变) ===
+        # =================================================================
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-        self.prune_points(prune_mask)
-        tmp_radii = self.tmp_radii
-        self.tmp_radii = None
 
+        self.prune_points(prune_mask)
+
+        self.tmp_radii = None
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
 
-    # [NEW] 统计函数：每次渲染后调用，累加可见性
-    def add_visibility_stats(self, visibility_filter):
-        # 终极对齐检查：如果长度不一致，说明经历了某种未被拦截的增删，强制对齐
-        if not hasattr(self, "visibility_stats") or self.visibility_stats.shape[0] != self.get_xyz.shape[0]:
-            new_stats = torch.zeros(self.get_xyz.shape[0], device="cuda")
-            if hasattr(self, "visibility_stats"):
-                old_size = min(self.visibility_stats.shape[0], new_stats.shape[0])
-                new_stats[:old_size] = self.visibility_stats[:old_size]
-            self.visibility_stats = new_stats
-
-        self.visibility_stats[visibility_filter] += 1
-
-    # [NEW] 剪枝函数：根据阈值删除低贡献点
-    def prune_low_visibility(self, threshold):
-        print(f"Pruning points with visibility count < {threshold}...")
-        initial_count = self.get_xyz.shape[0]
-
-        # 创建一个掩码，如果计数小于阈值，则标记为 True (需要被删除)
-        prune_mask = (self.vis_count < threshold)
-
-        # 调用现有的删除逻辑
-        self.prune_points(prune_mask)
-
-        final_count = self.get_xyz.shape[0]
-        print(f"Pruned {initial_count - final_count} points. Remaining: {final_count}")
+        # === [Modified] 累积不透明度梯度 ===
+        if self._opacity.grad is not None:
+            # 累积梯度的绝对值，梯度越大说明对 Loss 越敏感（越重要）
+            self.opacity_grad_accum[update_filter] += torch.abs(self._opacity.grad[update_filter])
+            self.opacity_grad_count[update_filter] += 1
+        # =================================
