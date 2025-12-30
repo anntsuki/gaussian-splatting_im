@@ -11,7 +11,7 @@ from utils.system_utils import searchForMaxIteration
 
 # === 核心配置 ===
 # 你的模型根目录
-SEARCH_DIR = "autodl-tmp/gaussian-splatting_feature-pruning/eval_line2"
+SEARCH_DIR = "/root/autodl-tmp/gaussian-splatting_feature-pruning/eval_line2"
 # 你的渲染和测评脚本路径
 RENDER_SCRIPT = "render.py"
 METRICS_SCRIPT = "metrics.py"
