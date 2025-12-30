@@ -14,7 +14,7 @@ from argparse import ArgumentParser
 import time
 
 # mipnerf360_outdoor_scenes = ["garden", "stump"]
-mipnerf360_outdoor_scenes = ["bicycle", "flowers", "garden", "stump", "treehill"]
+mipnerf360_outdoor_scenes = ["bicycle", "garden", "stump"]
 # mipnerf360_indoor_scenes = ["room", "kitchen"]
 mipnerf360_indoor_scenes = ["room", "counter", "kitchen", "bonsai"]
 tanks_and_temples_scenes = ["truck", "train"]

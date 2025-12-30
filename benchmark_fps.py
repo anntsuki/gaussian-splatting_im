@@ -27,7 +27,7 @@ def main():
 
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians, load_iteration=args.iteration, shuffle=False)
-    gaussians.training_setup(opt)  # 为了保持一致性（虽然后面不训练）
+    # gaussians.training_setup(opt)  # 为了保持一致性（虽然后面不训练）
 
     cams = scene.getTestCameras() if args.split == "test" else scene.getTrainCameras()
     cams = cams[: min(len(cams), args.n_views)]
