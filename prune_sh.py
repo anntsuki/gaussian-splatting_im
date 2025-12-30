@@ -27,7 +27,7 @@ def prune_sh_and_compress(input_path, output_path):
     # Step 1: Morton 排序 (Spatial Sorting)
     # =========================================================
     print("1. Applying Spatial Sorting...")
-    # 使用简单的 XYZ 字典序排序 (效果接近 Morton Code，但更快)
+    # 使用简单的 XYZ 字典序排序 (让数据更紧凑，利于 ZIP 压缩)
     sort_indices = np.lexsort((data['z'], data['y'], data['x']))
 
     for name in prop_names:
@@ -38,52 +38,45 @@ def prune_sh_and_compress(input_path, output_path):
     # =========================================================
     print("2. Pruning SH bands (Degree 2 & 3 -> 0)...")
 
-    # f_rest_0 到 f_rest_8 是 Degree 1 (保留)
-    # f_rest_9 到 f_rest_44 是 Degree 2 & 3 (置零)
     pruned_count = 0
     # 3DGS 一般有 45 个 rest 系数 (15 * 3)
     # 我们从第 9 个开始全部置零
     for i in range(9, 45):
         key = f"f_rest_{i}"
         if key in data:
-            # 将这些高频系数全部设为 0
+            # 将这些高频系数全部设为 0.0
             data[key] = np.zeros_like(data[key])
             pruned_count += 1
 
     print(f"   Zeroed out {pruned_count} high-frequency SH coefficients.")
 
     # =========================================================
-    # Step 3: FP16 量化 (Half-Precision)
+    # Step 3: 保存 (使用默认的 float32，避免报错)
     # =========================================================
-    print("3. Quantizing to FP16...")
-    new_dtype = []
-    output_data_arrays = []
+    # 注意：这里我们不再强制转 FP16，因为你的 plyfile 库不支持。
+    # 但不用担心，因为大部分数据是 0 且已排序，Zip 压缩后依然极小。
 
-    # [修复点]: 直接检查 numpy 数据的类型，而不是检查 ply property 对象
+    output_data_arrays = []
+    new_dtype = []
+
     for name in prop_names:
         arr = data[name]
-
-        # 检查 numpy 数组的类型是否为浮点数 ('f')
-        if arr.dtype.kind == 'f':
-            new_dtype.append((name, 'f2'))  # 'f2' 就是 float16
-            output_data_arrays.append(arr.astype(np.float16))
-        else:
-            new_dtype.append((name, arr.dtype))
-            output_data_arrays.append(arr)
+        # 直接使用原有的 dtype (通常是 f4/float32)
+        new_dtype.append((name, arr.dtype))
+        output_data_arrays.append(arr)
 
     # 组合数据
     output_data = np.empty(count, dtype=new_dtype)
     for i, name in enumerate(prop_names):
         output_data[name] = output_data_arrays[i]
 
-    # =========================================================
-    # 保存
-    # =========================================================
-    print(f"Saving to {output_path}...")
+    print(f"Saving to {output_path} (Format: FP32 Compatible)...")
     el = PlyElement.describe(output_data, 'vertex')
     PlyData([el]).write(output_path)
 
     print(f"Done! Saved to {output_path}")
+    print("IMPORTANT: The file size on disk is still large because it is FP32.")
+    print("Please manually ZIP this file to see the real compression effect!")
 
 
 if __name__ == "__main__":
@@ -94,7 +87,7 @@ if __name__ == "__main__":
 
     if args.output_ply is None:
         p = Path(args.input_ply)
-        # 自动命名
-        args.output_ply = str(p.parent / "point_cloud_sh1_fp16.ply")
+        # 命名为 pruned_sorted，表示已剪枝排序
+        args.output_ply = str(p.parent / "point_cloud_pruned_sorted.ply")
 
     prune_sh_and_compress(args.input_ply, args.output_ply)
