@@ -21,7 +21,7 @@ PRUNE_THRESHOLD = 0.005
 
 def compress_sh_logic(input_path, output_path, threshold=0.005):
     """
-    创新点2的核心代码：自适应 SH 剪枝
+    创新点2的核心代码：自适应 SH 剪枝 (已修正保护逻辑)
     """
     print(f"   -> Processing SH pruning for {input_path}...")
     gaussians = GaussianModel(sh_degree=3)
@@ -31,10 +31,22 @@ def compress_sh_logic(input_path, output_path, threshold=0.005):
     f_rest = gaussians._features_rest
     scales = gaussians.get_scaling
     max_scales = torch.max(scales, dim=1).values
+
+    # --- 调试信息：看看数据到底长什么样 ---
+    avg_energy = f_rest.abs().mean().item()
+    avg_scale = max_scales.mean().item()
+    print(f"      [Debug] Avg SH Energy: {avg_energy:.5f}, Avg Scale: {avg_scale:.5f}")
+
+    # 计算每个点的能量
     sh_energy = f_rest.abs().mean(dim=(1, 2))
 
-    # 2. 生成掩码 (保护微小结构 + 剪枝低频背景)
-    mask = (sh_energy < threshold) & (max_scales > 0.001)  # 0.001是保护阈值
+    # 2. 生成掩码 (修正版)
+    # 方案 A: 如果你不想要太复杂的保护，直接把 scale 限制去掉，或者改得非常小 (比如 1e-6)
+    # 方案 B: 稍微提高一点阈值，比如 0.005 -> 0.01 试试
+
+    # 这里我们将保护阈值从 0.001 降低到 0.00001 (1e-5)
+    # 并且如果压缩率还是很低，可以把 threshold 参数在调用时调大到 0.01
+    mask = (sh_energy < threshold) & (max_scales > 0.00001)
 
     # 3. 置零
     gaussians._features_rest[mask] = 0.0
@@ -45,6 +57,8 @@ def compress_sh_logic(input_path, output_path, threshold=0.005):
     # 返回统计数据
     pruned_count = mask.sum().item()
     total_count = f_rest.shape[0]
+    print(f"      [Debug] Pruned {pruned_count}/{total_count} points.")
+
     return pruned_count, total_count
 
 
