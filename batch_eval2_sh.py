@@ -42,7 +42,9 @@ def compress_sh_logic(input_path, output_path, prune_ratio=0.60):
     print(f"      [Debug] Calculated Threshold: {threshold:.5f}")
 
     # 3. 生成掩码 (小于这个阈值的全部剪掉)
-    mask = (sh_energy <= threshold)
+    scales = gaussians.get_scaling
+    max_scales = torch.max(scales, dim=1).values
+    mask = (sh_energy <= threshold) & (max_scales > 0.0005)
 
     # 4. 置零
     gaussians._features_rest[mask] = 0.0
