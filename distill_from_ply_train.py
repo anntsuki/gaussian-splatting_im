@@ -1,215 +1,157 @@
-# distill_from_ply_train.py
-import os
-import sys
-import copy
+import os, sys, copy
 import torch
 from random import randint
 from tqdm import tqdm
 from argparse import ArgumentParser
 
-from arguments import ModelParams, PipelineParams, OptimizationParams
+from arguments import ModelParams, PipelineParams
 from scene import Scene, GaussianModel
-from gaussian_renderer import render, network_gui
-from utils.general_utils import safe_state
+from gaussian_renderer import render
 from utils.loss_utils import l1_loss, ssim
 from utils.pose_utils import gaussian_poses
-from utils.logger_utils import prepare_output_and_logger, training_report
 
-def training_from_ply(args, dataset, opt, pipe, testing_iterations, saving_iterations,
-                      debug_from, new_max_sh, teacher_model_path):
-    """
-    Teacher & Student 都从 PLY 加载，不依赖任何 .pth checkpoint。
-    Teacher: SH=old_sh
-    Student: 从 teacher 参数初始化，然后降阶到 new_max_sh（如 2），只蒸馏训练 SH（默认不冻结 opacity/cov，可用开关冻结）
-    """
-    first_iter = 0
+def sh_rest_dim(deg: int) -> int:
+    return (deg + 1) ** 2 - 1
 
-    # 记录原 SH，Student 目标 SH
-    old_sh_degree = dataset.sh_degree
-    dataset.sh_degree = new_max_sh
-
-    # 输出目录 & cfg_args
-    tb_writer = prepare_output_and_logger(dataset)
-
-    # ---- Load teacher from PLY (model_path = teacher_model_path)
-    with torch.no_grad():
-        teacher_gaussians = GaussianModel(old_sh_degree)
-    teacher_dataset = copy.deepcopy(dataset)
-    teacher_dataset.model_path = teacher_model_path
-    teacher_scene = Scene(teacher_dataset, teacher_gaussians, load_iteration=args.iteration, shuffle=False)
-    teacher_gaussians.training_setup(copy.deepcopy(opt))
-
-    # ---- Build student: init from teacher params (capture/restore)
-    student_gaussians = GaussianModel(old_sh_degree)
-    student_scene = Scene(dataset, student_gaussians)  # output model_path = args.model_path
-
-    # 用 teacher 的参数初始化 student
-    with torch.no_grad():
-        student_gaussians.restore(teacher_gaussians.capture(), copy.deepcopy(opt))
-
-    # 降 SH 阶：3->2（按你仓库里的实现，通常 oneDown 一次即可）
-    student_gaussians.max_sh_degree = new_max_sh
-    if hasattr(student_gaussians, "onedownSHdegree"):
-        # 多降几次也安全：直到 max_sh_degree == new_max_sh
-        # 注意：有些实现 onedownSHdegree 只做一次降阶，不更新 max_sh_degree
-        # 所以我们最多循环 3 次兜底
-        for _ in range(3):
-            try:
-                student_gaussians.onedownSHdegree()
-            except Exception:
-                break
+@torch.no_grad()
+def truncate_sh_to(student: GaussianModel, target_sh: int):
+    """把 student 的 SH rest 系数截断到 target_sh 对应维度（保留低阶系数）"""
+    k = sh_rest_dim(target_sh)
+    if hasattr(student, "_features_rest"):
+        if student._features_rest.shape[-1] >= k:
+            student._features_rest = torch.nn.Parameter(student._features_rest[:, :, :k].contiguous())
+        else:
+            raise RuntimeError(f"features_rest dim too small: {student._features_rest.shape[-1]} < {k}")
     else:
-        raise RuntimeError("你的 GaussianModel 里没有 onedownSHdegree()，无法自动降阶。")
+        raise RuntimeError("GaussianModel missing _features_rest")
 
-    # 设置训练
-    student_gaussians.training_setup(opt)
+def freeze_non_sh(student: GaussianModel, enable_covariance: bool, enable_opacity: bool):
+    # geometry
+    if hasattr(student, "_xyz"): student._xyz.requires_grad_(False)
+    if hasattr(student, "_scaling"): student._scaling.requires_grad_(enable_covariance)  # covariance off => freeze
+    if hasattr(student, "_rotation"): student._rotation.requires_grad_(enable_covariance)
+    if hasattr(student, "_opacity"): student._opacity.requires_grad_(enable_opacity)
 
-    # 可选冻结：协方差/不透明度（与你 distill_train.py 同款开关）
-    if (not args.enable_covariance):
-        if hasattr(student_gaussians, "_scaling"):
-            student_gaussians._scaling.requires_grad = False
-        if hasattr(student_gaussians, "_rotation"):
-            student_gaussians._rotation.requires_grad = False
+    # SH
+    student._features_dc.requires_grad_(True)
+    student._features_rest.requires_grad_(True)
 
-    if (not args.enable_opacity):
-        if hasattr(student_gaussians, "_opacity"):
-            student_gaussians._opacity.requires_grad = False
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
+
+def main():
+    parser = ArgumentParser("PLY-based SH distillation (no .pth)")
+    lp = ModelParams(parser)
+    pp = PipelineParams(parser)
+
+    parser.add_argument("--teacher_model_path", type=str, required=True,
+                        help="teacher 模型目录（里面有 point_cloud/iteration_x/point_cloud.ply）")
+    parser.add_argument("--iteration", type=int, default=30000)
+    parser.add_argument("--save_iteration", type=int, default=30000)
+
+    parser.add_argument("--new_max_sh", type=int, default=2, choices=[1,2,3])
+    parser.add_argument("--iters", type=int, default=6000)
+    parser.add_argument("--lr_sh", type=float, default=1e-2)
+    parser.add_argument("--lambda_dssim", type=float, default=0.2)
+
+    parser.add_argument("--augmented_view", action="store_true")
+    parser.add_argument("--pv_trans", type=float, default=0.05)
+    parser.add_argument("--pv_rot", type=float, default=0.0)
+
+    parser.add_argument("--enable_covariance", action="store_true")
+    parser.add_argument("--enable_opacity", action="store_true")
+
+    args = parser.parse_args(sys.argv[1:])
+
+    dataset = lp.extract(args)
+    pipe = pp.extract(args)
 
     # background
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    iter_start = torch.cuda.Event(enable_timing=True)
-    iter_end = torch.cuda.Event(enable_timing=True)
+    # ---- load teacher from PLY
+    teacher_ds = copy.deepcopy(dataset)
+    teacher_ds.model_path = args.teacher_model_path
+    teacher = GaussianModel(teacher_ds.sh_degree)
+    teacher_scene = Scene(teacher_ds, teacher, load_iteration=args.iteration, shuffle=False)
+    teacher.eval()
 
-    viewpoint_stack = None
-    ema_loss_for_log = 0.0
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc=f"Distill (PLY) progress")
-    first_iter += 1
+    # ---- load student from same PLY, then down-sh to new_max_sh
+    student = GaussianModel(teacher_ds.sh_degree)
+    _ = Scene(teacher_ds, student, load_iteration=args.iteration, shuffle=False)  # load same ply into student
 
-    for iteration in range(first_iter, opt.iterations + 1):
-        # GUI 相关：你不用 GUI 也没事，保持兼容
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(custom_cam, student_gaussians, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, 0, 1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+    # 降到 SH=2（先调用 onedownSHdegree，如果你分支有；没有就直接截断）
+    target_sh = args.new_max_sh
+    with torch.no_grad():
+        if hasattr(student, "onedownSHdegree"):
+            student.max_sh_degree = target_sh
+            # 多调用几次兜底（有的实现一次只降 1 阶）
+            for _ in range(3):
+                try:
+                    student.onedownSHdegree()
+                except Exception:
                     break
-            except Exception:
-                network_gui.conn = None
+        # 再保险：强制截断到 target_sh 对应维度
+        truncate_sh_to(student, target_sh)
 
-        iter_start.record()
-        student_gaussians.update_learning_rate(iteration)
+    # 冻结非 SH
+    freeze_non_sh(student, enable_covariance=args.enable_covariance, enable_opacity=args.enable_opacity)
 
-        if not viewpoint_stack:
-            viewpoint_stack = student_scene.getTrainCameras().copy()
-
-        viewpoint_cam_org = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
-        viewpoint_cam = copy.deepcopy(viewpoint_cam_org)
-
-        if (iteration - 1) == debug_from:
-            pipe.debug = True
-
-        # pseudo view（与你贴的 distill_train 同款逻辑）
-        if args.augmented_view and (iteration % 3):
-            viewpoint_cam = gaussian_poses(
-                viewpoint_cam, mean=0, std_dev_translation=args.pv_trans, std_dev_rotation=args.pv_rot
-            )
-
-        # student render
-        student_image = render(viewpoint_cam, student_gaussians, pipe, background)["render"]
-        # teacher render (detach)
-        with torch.no_grad():
-            teacher_image = render(viewpoint_cam, teacher_gaussians, pipe, background)["render"].detach()
-
-        Ll1 = l1_loss(student_image, teacher_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(student_image, teacher_image))
-        loss.backward()
-
-        iter_end.record()
-
-        with torch.no_grad():
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.7f}"})
-                progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
-
-            # 保存（默认保存到 iteration=args.iteration，方便你 benchmark 继续用 30000）
-            if (iteration in saving_iterations) or (iteration == opt.iterations):
-                save_it = args.save_iteration
-                print(f"\n[ITER {iteration}] Saving distilled Gaussians as iteration_{save_it}")
-                student_scene.save(save_it)
-
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss,
-                            iter_start.elapsed_time(iter_end), testing_iterations,
-                            student_scene, render, (pipe, background))
-
-            if iteration < opt.iterations:
-                student_gaussians.optimizer.step()
-                student_gaussians.optimizer.zero_grad(set_to_none=True)
-
-def main():
-    parser = ArgumentParser(description="PLY-based SH distillation (no .pth needed)")
-    lp = ModelParams(parser)
-    op = OptimizationParams(parser)
-    pp = PipelineParams(parser)
-
-    # extra args
-    parser.add_argument("--teacher_model_path", type=str, required=True,
-                        help="Teacher 模型目录（里面有 point_cloud/iteration_x/point_cloud.ply）")
-    parser.add_argument("--iteration", type=int, default=30000,
-                        help="从 teacher 的 iteration_XXX 读取 PLY")
-    parser.add_argument("--save_iteration", type=int, default=30000,
-                        help="把蒸馏后的 ply 保存为 iteration_XXX（默认 30000，方便直接用你原评测命令）")
-    parser.add_argument("--new_max_sh", type=int, default=2)
-    parser.add_argument("--augmented_view", action="store_true")
-    parser.add_argument("--pv_trans", type=float, default=0.05)
-    parser.add_argument("--pv_rot", type=float, default=0.0)
-
-    # keep same flags as your distill_train
-    parser.add_argument("--enable_covariance", action="store_true")
-    parser.add_argument("--enable_opacity", action="store_true")
-
-    parser.add_argument('--ip', type=str, default="127.0.0.1")
-    parser.add_argument('--port', type=int, default=6009)
-    parser.add_argument('--debug_from', type=int, default=-1)
-    parser.add_argument('--detect_anomaly', action='store_true', default=False)
-
-    # 你不需要 test/save/checkpoint 的复杂逻辑，保留接口兼容
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1])
-    parser.add_argument("--quiet", action="store_true")
-
-    args = parser.parse_args(sys.argv[1:])
-    print("Distill output model_path:", args.model_path)
-    safe_state(args.quiet)
-
-    network_gui.init(args.ip, args.port)
-    torch.autograd.set_detect_anomaly(args.detect_anomaly)
-
-    dataset = lp.extract(args)
-    opt = op.extract(args)
-    pipe = pp.extract(args)
-
-    # 训练时用 opt.iterations 控制“蒸馏步数”
-    training_from_ply(
-        args, dataset, opt, pipe,
-        testing_iterations=args.test_iterations,
-        saving_iterations=args.save_iterations,
-        debug_from=args.debug_from,
-        new_max_sh=args.new_max_sh,
-        teacher_model_path=args.teacher_model_path
+    # optimizer（只训 SH）
+    optim = torch.optim.Adam(
+        [{"params": [student._features_dc], "lr": args.lr_sh},
+         {"params": [student._features_rest], "lr": args.lr_sh}]
     )
 
-    print("\nDistill complete.")
+    # cams
+    cams = teacher_scene.getTrainCameras()
+    assert len(cams) > 0
+
+    use_exp = getattr(dataset, "train_test_exp", False)
+
+    pbar = tqdm(range(1, args.iters + 1), desc="Distill SH")
+    for it in pbar:
+        cam_org = cams[randint(0, len(cams) - 1)]
+        cam = copy.deepcopy(cam_org)
+
+        if args.augmented_view and (it % 3 != 0):
+            cam = gaussian_poses(cam, mean=0, std_dev_translation=args.pv_trans, std_dev_rotation=args.pv_rot)
+
+        # teacher target
+        with torch.no_grad():
+            t_img = render(cam, teacher, pipe, background, use_trained_exp=use_exp)["render"].detach()
+
+        # student
+        s_img = render(cam, student, pipe, background, use_trained_exp=use_exp)["render"]
+
+        Ll1 = l1_loss(s_img, t_img)
+        loss = (1.0 - args.lambda_dssim) * Ll1 + args.lambda_dssim * (1.0 - ssim(s_img, t_img))
+
+        optim.zero_grad(set_to_none=True)
+        loss.backward()
+        optim.step()
+
+        if it % 50 == 0:
+            pbar.set_postfix(loss=float(loss.item()), l1=float(Ll1.item()))
+
+    # ---- save distilled ply (保持你评测脚本兼容：cfg_args + point_cloud/iteration_x/point_cloud.ply)
+    out_dir = args.model_path
+    ensure_dir(out_dir)
+    # copy cfg_args for evaluation scripts
+    cfg_src = os.path.join(args.teacher_model_path, "cfg_args")
+    if os.path.exists(cfg_src):
+        import shutil
+        shutil.copy(cfg_src, os.path.join(out_dir, "cfg_args"))
+
+    pc_dir = os.path.join(out_dir, "point_cloud", f"iteration_{args.save_iteration}")
+    ensure_dir(pc_dir)
+    out_ply = os.path.join(pc_dir, "point_cloud.ply")
+    student.save_ply(out_ply)
+
+    print("Saved distilled model to:", out_dir)
+    print("PLY:", out_ply)
 
 if __name__ == "__main__":
+    torch.cuda.set_device(0)
     main()
