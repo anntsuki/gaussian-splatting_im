@@ -3,97 +3,22 @@ import os
 import sys
 import json
 import csv
-import time
-import math
 from argparse import ArgumentParser
 
 import torch
-import torch.nn.functional as F
 
 from arguments import ModelParams, PipelineParams, OptimizationParams, get_combined_args
 from scene import Scene, GaussianModel
 from gaussian_renderer import render
 
-
-# -----------------------------
-# Metrics (self-contained)
-# -----------------------------
-def psnr_torch(img: torch.Tensor, gt: torch.Tensor, eps: float = 1e-10) -> float:
-    # img, gt: [3,H,W] in [0,1]
-    mse = torch.mean((img - gt) ** 2)
-    mse = torch.clamp(mse, min=eps)
-    return float((-10.0 * torch.log10(mse)).item())
+# ---- Use OFFICIAL metric implementations (same as metrics.py you sent) ----
+from utils.image_utils import psnr as official_psnr
+from utils.loss_utils import ssim as official_ssim
+from lpipsPyTorch import lpips as official_lpips
 
 
-def _gaussian_window(window_size: int, sigma: float, device, dtype):
-    coords = torch.arange(window_size, device=device, dtype=dtype) - window_size // 2
-    g = torch.exp(-(coords**2) / (2 * sigma * sigma))
-    g = g / g.sum()
-    window_1d = g.view(1, 1, -1)
-    window_2d = window_1d.transpose(2, 1) @ window_1d  # [1,1,ws,ws]
-    return window_2d
-
-
-def ssim_torch(img: torch.Tensor, gt: torch.Tensor, window_size: int = 11, sigma: float = 1.5) -> float:
-    """
-    SSIM over RGB, average over channels.
-    img, gt: [3,H,W] in [0,1]
-    """
-    # to [1,3,H,W]
-    x = img.unsqueeze(0)
-    y = gt.unsqueeze(0)
-
-    device, dtype = x.device, x.dtype
-    window = _gaussian_window(window_size, sigma, device, dtype)
-    window = window.expand(3, 1, window_size, window_size)  # groups=3
-
-    # compute statistics
-    mu_x = F.conv2d(x, window, padding=window_size // 2, groups=3)
-    mu_y = F.conv2d(y, window, padding=window_size // 2, groups=3)
-
-    mu_x2 = mu_x * mu_x
-    mu_y2 = mu_y * mu_y
-    mu_xy = mu_x * mu_y
-
-    sigma_x2 = F.conv2d(x * x, window, padding=window_size // 2, groups=3) - mu_x2
-    sigma_y2 = F.conv2d(y * y, window, padding=window_size // 2, groups=3) - mu_y2
-    sigma_xy = F.conv2d(x * y, window, padding=window_size // 2, groups=3) - mu_xy
-
-    C1 = (0.01 ** 2)
-    C2 = (0.03 ** 2)
-
-    ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / ((mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2))
-    return float(ssim_map.mean().item())
-
-
-def make_lpips(net: str = "vgg"):
-    try:
-        import lpips
-    except Exception as e:
-        raise RuntimeError(
-            "未找到 lpips 包。请先安装：pip install lpips\n"
-            f"原始错误：{e}"
-        )
-    model = lpips.LPIPS(net=net)
-    return model
-
-
-@torch.no_grad()
-def lpips_torch(lpips_model, img: torch.Tensor, gt: torch.Tensor) -> float:
-    """
-    img, gt: [3,H,W] in [0,1]
-    LPIPS expects [-1,1], [1,3,H,W]
-    """
-    x = img.unsqueeze(0) * 2.0 - 1.0
-    y = gt.unsqueeze(0) * 2.0 - 1.0
-    v = lpips_model(x, y)
-    return float(v.mean().item())
-
-
-# -----------------------------
-# Utils
-# -----------------------------
 def discover_model_paths(models_root: str):
+    """Discover per-scene model_path under models_root (one-level)."""
     paths = []
     if not os.path.isdir(models_root):
         raise FileNotFoundError(f"models_root 不存在或不是目录：{models_root}")
@@ -102,7 +27,6 @@ def discover_model_paths(models_root: str):
         p = os.path.join(models_root, name)
         if not os.path.isdir(p):
             continue
-        # 典型 output 目录会有 cfg_args 和 point_cloud
         if os.path.exists(os.path.join(p, "cfg_args")) or os.path.exists(os.path.join(p, "point_cloud")):
             paths.append(p)
     return paths
@@ -115,39 +39,23 @@ def get_ply_mb(model_path: str, iteration: int):
     return None
 
 
-def apply_mask_and_background(img: torch.Tensor, gt: torch.Tensor, cam, background: torch.Tensor):
-    """
-    让 img/gt 在 mask 外填充背景，避免透明区域影响指标。
-    """
-    mask = None
-    # 不同分支可能字段名不同，尽量兼容
-    for key in ["gt_alpha_mask", "alpha_mask", "mask"]:
-        if hasattr(cam, key):
-            m = getattr(cam, key)
-            if m is not None:
-                mask = m
-                break
-
-    if mask is None:
-        return img, gt
-
-    if mask.dim() == 2:
-        mask = mask.unsqueeze(0)  # [1,H,W]
-    if mask.shape[0] == 1:
-        mask = mask.repeat(3, 1, 1)  # [3,H,W]
-
-    mask = mask.to(img.device, dtype=img.dtype).clamp(0, 1)
-    bg = background.view(3, 1, 1).to(img.dtype)
-
-    img2 = img * mask + bg * (1 - mask)
-    gt2 = gt * mask + bg * (1 - mask)
-    return img2, gt2
-
-
 @torch.no_grad()
-def eval_one_model(model_path: str, iteration: int, split: str, n_views: int, warmup: int,
-                   lpips_model=None, lpips_enabled=True):
-    # 为了复用 get_combined_args（它会读取 model_path 下的 cfg_args），这里临时改 sys.argv
+def eval_one_model(
+    model_path: str,
+    iteration: int,
+    split: str,
+    n_views: int,
+    warmup: int,
+    lpips_net: str = "vgg",  # keep same default as official metrics.py
+):
+    """
+    Evaluate one model_path and output:
+    PSNR/SSIM/LPIPS using official functions
+    FPS/PeakMem using CUDA events (render-only timing)
+    #Gaussians and PLY size
+    """
+
+    # ---- Reuse get_combined_args so it loads cfg_args inside model_path
     argv_backup = sys.argv
     try:
         parser = ArgumentParser()
@@ -160,11 +68,14 @@ def eval_one_model(model_path: str, iteration: int, split: str, n_views: int, wa
         parser.add_argument("--n_views", type=int, default=n_views)
         parser.add_argument("--warmup", type=int, default=warmup)
 
-        sys.argv = [argv_backup[0], "-m", model_path,
-                    "--iteration", str(iteration),
-                    "--split", split,
-                    "--n_views", str(n_views),
-                    "--warmup", str(warmup)]
+        sys.argv = [
+            argv_backup[0],
+            "-m", model_path,
+            "--iteration", str(iteration),
+            "--split", split,
+            "--n_views", str(n_views),
+            "--warmup", str(warmup),
+        ]
         args = get_combined_args(parser)
     finally:
         sys.argv = argv_backup
@@ -179,13 +90,13 @@ def eval_one_model(model_path: str, iteration: int, split: str, n_views: int, wa
     cams = scene.getTestCameras() if args.split == "test" else scene.getTrainCameras()
     if len(cams) == 0:
         raise RuntimeError(f"{model_path} split={args.split} 没有相机可用")
+
     cams = cams[: min(len(cams), args.n_views)]
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    # ---------------- FPS / PeakMem（只计 render）
-    # warmup
+    # ---------------- FPS / PeakMem (render-only)
     for i in range(min(args.warmup, len(cams))):
         _ = render(cams[i], gaussians, pipe, background, use_trained_exp=dataset.train_test_exp)["render"]
     torch.cuda.synchronize()
@@ -206,28 +117,32 @@ def eval_one_model(model_path: str, iteration: int, split: str, n_views: int, wa
     fps = 1000.0 / avg_ms
     peak_mem_mb = torch.cuda.max_memory_allocated() / (1024**2)
 
-    # ---------------- Quality metrics（再渲一次，避免把 metric 计入 FPS）
+    # ---------------- Quality metrics (OFFICIAL-style)
+    # IMPORTANT: official metrics.py reads PNG -> to_tensor -> [1,3,H,W] in [0,1]
+    # Here we mimic that interface: [1,3,H,W] in [0,1] WITHOUT extra normalization/masking.
     psnrs, ssims, lpipss = [], [], []
     for cam in cams:
         pkg = render(cam, gaussians, pipe, background, use_trained_exp=dataset.train_test_exp)
         img = pkg["render"].clamp(0, 1)
         gt = cam.original_image.to("cuda").clamp(0, 1)
 
-        img, gt = apply_mask_and_background(img, gt, cam, background)
+        img_b = img.unsqueeze(0)  # [1,3,H,W]
+        gt_b = gt.unsqueeze(0)
 
-        psnrs.append(psnr_torch(img, gt))
-        ssims.append(ssim_torch(img, gt))
+        p = official_psnr(img_b, gt_b)
+        s = official_ssim(img_b, gt_b)
+        l = official_lpips(img_b, gt_b, net_type=lpips_net)
 
-        if lpips_enabled:
-            if lpips_model is None:
-                raise RuntimeError("lpips_enabled=True 但 lpips_model=None")
-            lpipss.append(lpips_torch(lpips_model, img, gt))
+        # official funcs may return tensors; robustly reduce to scalar
+        psnrs.append(float(torch.mean(p).item()) if torch.is_tensor(p) else float(p))
+        ssims.append(float(torch.mean(s).item()) if torch.is_tensor(s) else float(s))
+        lpipss.append(float(torch.mean(l).item()) if torch.is_tensor(l) else float(l))
 
     psnr_avg = float(sum(psnrs) / len(psnrs))
     ssim_avg = float(sum(ssims) / len(ssims))
-    lpips_avg = float(sum(lpipss) / len(lpipss)) if lpips_enabled else None
+    lpips_avg = float(sum(lpipss) / len(lpipss))
 
-    # others
+    # other stats
     ply_mb = get_ply_mb(model_path, args.iteration)
     n_pts = int(gaussians.get_xyz.shape[0])
 
@@ -248,6 +163,7 @@ def eval_one_model(model_path: str, iteration: int, split: str, n_views: int, wa
 
         "num_gaussians": n_pts,
         "PLY_MB": ply_mb,
+        "lpips_net": lpips_net,
     }
     return out
 
@@ -262,7 +178,6 @@ def main():
     parser.add_argument("--n_views", type=int, default=50)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--lpips_net", type=str, default="vgg", choices=["vgg", "alex"])
-    parser.add_argument("--no_lpips", action="store_true")
     parser.add_argument("--out_json", type=str, default="all_metrics.json")
     parser.add_argument("--out_csv", type=str, default="all_metrics.csv")
     args = parser.parse_args()
@@ -272,11 +187,6 @@ def main():
     model_paths = discover_model_paths(args.models_root)
     if len(model_paths) == 0:
         raise RuntimeError(f"在 {args.models_root} 下未发现任何场景目录（需要含 cfg_args 或 point_cloud）")
-
-    lpips_model = None
-    lpips_enabled = (not args.no_lpips)
-    if lpips_enabled:
-        lpips_model = make_lpips(net=args.lpips_net).cuda().eval()
 
     results = []
     for i, mp in enumerate(model_paths):
@@ -289,15 +199,14 @@ def main():
                 split=args.split,
                 n_views=args.n_views,
                 warmup=args.warmup,
-                lpips_model=lpips_model,
-                lpips_enabled=lpips_enabled,
+                lpips_net=args.lpips_net,
             )
             results.append(out)
             print(json.dumps(out, indent=2))
         except Exception as e:
             print(f"!! Failed on {mp}: {e}")
 
-    # 汇总均值（只对成功的场景）
+    # summary
     def mean_of(key):
         vals = [r[key] for r in results if r.get(key) is not None]
         return (sum(vals) / len(vals)) if len(vals) > 0 else None
@@ -305,6 +214,7 @@ def main():
     summary = {
         "models_root": args.models_root,
         "num_scenes_ok": len(results),
+        "lpips_net": args.lpips_net,
         "mean_PSNR": mean_of("PSNR"),
         "mean_SSIM": mean_of("SSIM"),
         "mean_LPIPS": mean_of("LPIPS"),
@@ -316,18 +226,17 @@ def main():
 
     payload = {"summary": summary, "results": results}
 
-    # 写 JSON
     out_json_path = os.path.join(args.models_root, args.out_json)
     with open(out_json_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
-    # 写 CSV
     out_csv_path = os.path.join(args.models_root, args.out_csv)
     fieldnames = [
         "scene", "iteration", "split", "n_views",
         "PSNR", "SSIM", "LPIPS",
         "FPS", "avg_ms", "PeakMemMB",
         "num_gaussians", "PLY_MB",
+        "lpips_net",
         "model_path",
     ]
     with open(out_csv_path, "w", newline="", encoding="utf-8") as f:
