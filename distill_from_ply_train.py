@@ -10,7 +10,23 @@ from gaussian_renderer import render
 from utils.loss_utils import l1_loss, ssim
 from utils.pose_utils import gaussian_poses
 
+import re
 
+def patch_cfg_args_sh_degree(cfg_path: str, new_sh: int):
+    if not os.path.exists(cfg_path):
+        return
+    s = open(cfg_path, "r", encoding="utf-8", errors="ignore").read()
+
+    # 兼容常见写法：sh_degree=3 / sh_degree: 3 / sh_degree 3 等
+    s2 = s
+    s2 = re.sub(r"(sh_degree\s*=\s*)\d+", rf"\g<1>{new_sh}", s2)
+    s2 = re.sub(r"(sh_degree\s*:\s*)\d+", rf"\g<1>{new_sh}", s2)
+    s2 = re.sub(r"(max_sh_degree\s*=\s*)\d+", rf"\g<1>{new_sh}", s2)
+    s2 = re.sub(r"(max_sh_degree\s*:\s*)\d+", rf"\g<1>{new_sh}", s2)
+
+    # 有些 cfg_args 是 Namespace(...) 的 repr，也能被上面 regex 命中
+    if s2 != s:
+        open(cfg_path, "w", encoding="utf-8").write(s2)
 def sh_rest_dim(deg: int) -> int:
     # exclude DC (l=0)
     return (deg + 1) ** 2 - 1
@@ -183,9 +199,13 @@ def main():
 
     # copy cfg_args（benchmark 脚本靠它）
     for fname in ["cfg_args", "cameras.json", "exposure.json"]:
-        src = os.path.join(args.teacher_model_path, fname)
-        if os.path.exists(src):
-            shutil.copy(src, os.path.join(out_dir, fname))
+        cfg_dst = os.path.join(out_dir, "cfg_args")
+        cfg_src = os.path.join(args.teacher_model_path, "cfg_args")
+        if os.path.exists(cfg_src):
+            shutil.copy(cfg_src, cfg_dst)
+
+        # ✅关键：自动把 cfg_args 里的 sh_degree 改成 new_max_sh
+        patch_cfg_args_sh_degree(cfg_dst, args.new_max_sh)
 
     pc_dir = os.path.join(out_dir, "point_cloud", f"iteration_{args.save_iteration}")
     ensure_dir(pc_dir)
