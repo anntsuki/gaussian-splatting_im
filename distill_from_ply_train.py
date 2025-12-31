@@ -18,14 +18,39 @@ def sh_rest_dim(deg: int) -> int:
 
 @torch.no_grad()
 def force_truncate_sh(student: GaussianModel, target_sh: int):
-    """强制把 features_rest 截断到 target_sh 对应维度（保留低阶系数）"""
+    """强制把 features_rest 截断到 target_sh 对应维度，兼容 [N,3,K] 和 [N,K,3] 两种布局"""
     k = sh_rest_dim(target_sh)
+
     if not hasattr(student, "_features_rest"):
         raise RuntimeError("GaussianModel has no _features_rest")
+
     fr = student._features_rest
-    if fr.shape[-1] < k:
-        raise RuntimeError(f"_features_rest dim {fr.shape[-1]} < needed {k}")
-    student._features_rest = torch.nn.Parameter(fr[:, :, :k].contiguous())
+    if fr.ndim != 3:
+        raise RuntimeError(f"_features_rest expect 3D tensor, got shape={tuple(fr.shape)}")
+
+    # 判断哪一维是 RGB(=3)，另一维就是 SH 系数维度 K
+    # 常见两种：
+    #   [N, 3, K] -> coeff_axis=2
+    #   [N, K, 3] -> coeff_axis=1
+    if fr.shape[1] == 3 and fr.shape[2] != 3:
+        coeff_axis = 2
+    elif fr.shape[2] == 3 and fr.shape[1] != 3:
+        coeff_axis = 1
+    else:
+        # 兜底：把更大的那一维当成系数维度
+        coeff_axis = 1 if fr.shape[1] > fr.shape[2] else 2
+
+    coeff_dim = fr.shape[coeff_axis]
+    if coeff_dim < k:
+        raise RuntimeError(f"SH coeff dim {coeff_dim} < needed {k}, shape={tuple(fr.shape)}, coeff_axis={coeff_axis}")
+
+    if coeff_axis == 1:
+        new_fr = fr[:, :k, :]
+    else:
+        new_fr = fr[:, :, :k]
+
+    student._features_rest = torch.nn.Parameter(new_fr.contiguous())
+
 
 
 def set_requires_grad(student: GaussianModel, enable_covariance: bool, enable_opacity: bool):
