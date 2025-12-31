@@ -37,7 +37,7 @@ def training_from_ply(args, dataset, opt, pipe, testing_iterations, saving_itera
     teacher_dataset = copy.deepcopy(dataset)
     teacher_dataset.model_path = teacher_model_path
     teacher_scene = Scene(teacher_dataset, teacher_gaussians, load_iteration=args.iteration, shuffle=False)
-    teacher_gaussians.optimizer = None  # teacher 不训练
+    teacher_gaussians.training_setup(copy.deepcopy(opt))
 
     # ---- Build student: init from teacher params (capture/restore)
     student_gaussians = GaussianModel(old_sh_degree)
