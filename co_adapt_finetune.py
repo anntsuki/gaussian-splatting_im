@@ -30,26 +30,40 @@ def _scale_optimizer_lr(optimizer, lr_scale: float):
             g["lr"] *= lr_scale
 
 
-def training_co_adapt(dataset, opt, pipe, load_iter: int, co_iters: int, save_every: int, save_iter: int, lr_scale: float):
-    # 让学习率 schedule 的“总迭代数”合理（有些实现会用 opt.iterations 做 max step）
+def training_co_adapt(dataset, opt, pipe, load_iter: int, co_iters: int, save_every: int, save_iter: int,
+                      lr_scale: float):
+    # 让学习率 schedule 的“总迭代数”合理
     opt.iterations = int(load_iter + co_iters)
 
     gaussians = _make_gaussian_model(dataset, opt)
     scene = Scene(dataset, gaussians, load_iteration=load_iter, shuffle=True)
 
-    # 初始化 optimizer（co-adaptation 是“短训恢复”，重新建 optimizer 就行）
+    # ================= 修复开始 =================
+    # 尝试初始化 optimizer，如果缺 _exposure 就手动补一个 dummy
     try:
         gaussians.training_setup(opt)
     except AttributeError as e:
-        # 如果你分支里 exposure 相关会报错，这里兜底关掉 exposure（大多数 360 配置本来也不需要）
+        # 捕获缺少 _exposure 的错误
         if "_exposure" in str(e):
+            print("[WARN] Detect missing '_exposure'. Injecting dummy parameter to bypass error.")
+
+            # 1. 强制关闭 Dataset 和 Option 中的曝光开关 (防止渲染时调用)
             if hasattr(dataset, "train_test_exp"):
                 dataset.train_test_exp = False
             if hasattr(opt, "train_test_exp"):
                 opt.train_test_exp = False
+
+            # 2. 【核心修复】手动注入一个假的参数
+            # 只要是 nn.Parameter，优化器就能初始化成功。
+            # 形状设为 [1] 即可，反正我们禁用了它，不会参与计算。
+            gaussians._exposure = torch.nn.Parameter(torch.zeros(1, device="cuda"))
+
+            # 3. 再次尝试 setup，这次一定能过
             gaussians.training_setup(opt)
         else:
-            raise
+            # 如果是其他错误，照常抛出
+            raise e
+    # ================= 修复结束 =================
 
     _scale_optimizer_lr(gaussians.optimizer, lr_scale)
 
@@ -67,13 +81,14 @@ def training_co_adapt(dataset, opt, pipe, load_iter: int, co_iters: int, save_ev
 
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
-        # 渲染 + photometric loss（论文里就是用原训练视角 photometric loss 做恢复）:contentReference[oaicite:1]{index=1}
+        # 渲染
+        # 【关键】强制 use_trained_exp=False，确保不会用到我们造的假参数
         render_pkg = render(
             viewpoint_cam,
             gaussians,
             pipe,
             background,
-            use_trained_exp=dataset.train_test_exp,
+            use_trained_exp=False,
         )
         image = render_pkg["render"]
         gt = viewpoint_cam.original_image.cuda()
@@ -85,23 +100,18 @@ def training_co_adapt(dataset, opt, pipe, load_iter: int, co_iters: int, save_ev
         gaussians.optimizer.step()
         gaussians.optimizer.zero_grad(set_to_none=True)
 
-        pbar.set_postfix(loss=float(loss.item()), L1=float(Ll1.item()))
+        if iteration % 100 == 0:
+            pbar.set_postfix(loss=float(loss.item()), L1=float(Ll1.item()))
 
-        # 定期保存（可选）
+        # 定期保存
         if save_every > 0 and iteration % save_every == 0:
             print(f"\n[ITER {iteration}] Saving Gaussians")
             scene.save(iteration)
 
-    # 最终保存到你指定的 save_iter（默认 load_iter + co_iters）
+    # 最终保存
     final_iter = int(save_iter) if save_iter is not None else int(opt.iterations)
-    if final_iter != opt.iterations:
-        # 你要一个“固定编号”的保存点，就再存一次
-        print(f"\n[FINAL SAVE] Saving Gaussians at iter {final_iter}")
-        scene.save(final_iter)
-    else:
-        print(f"\n[FINAL SAVE] Saving Gaussians at iter {opt.iterations}")
-        scene.save(opt.iterations)
-
+    print(f"\n[FINAL SAVE] Saving Gaussians at iter {final_iter}")
+    scene.save(final_iter)
 
 @torch.no_grad()
 def main():
