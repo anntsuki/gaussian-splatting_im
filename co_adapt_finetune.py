@@ -38,33 +38,33 @@ def training_co_adapt(dataset, opt, pipe, load_iter: int, co_iters: int, save_ev
     gaussians = _make_gaussian_model(dataset, opt)
     scene = Scene(dataset, gaussians, load_iteration=load_iter, shuffle=True)
 
-    # ================= 修复开始 =================
-    # 尝试初始化 optimizer，如果缺 _exposure 就手动补一个 dummy
+    # 初始化 optimizer
     try:
         gaussians.training_setup(opt)
     except AttributeError as e:
-        # 捕获缺少 _exposure 的错误
+        # 如果报错缺少 _exposure
         if "_exposure" in str(e):
-            print("[WARN] Detect missing '_exposure'. Injecting dummy parameter to bypass error.")
+            print("[WARN] Model missing '_exposure'. Injecting dummy attributes to bypass error.")
 
-            # 1. 强制关闭 Dataset 和 Option 中的曝光开关 (防止渲染时调用)
+            # 1. 强制关闭 Dataset 和 Option 中的曝光开关
             if hasattr(dataset, "train_test_exp"):
                 dataset.train_test_exp = False
             if hasattr(opt, "train_test_exp"):
                 opt.train_test_exp = False
 
-            # 2. 【核心修复】手动注入一个假的参数
-            # 只要是 nn.Parameter，优化器就能初始化成功。
-            # 形状设为 [1] 即可，反正我们禁用了它，不会参与计算。
+            # 2. 注入假的 exposure 参数
             gaussians._exposure = torch.nn.Parameter(torch.zeros(1, device="cuda"))
 
-            # 3. 再次尝试 setup，这次一定能过
+            # 3. 【关键新增】注入 pretrained_exposures 属性
+            # update_learning_rate 会检查这个属性，如果没有就会报错
+            gaussians.pretrained_exposures = None
+
+            # 4. 再次尝试 setup
             gaussians.training_setup(opt)
         else:
-            # 如果是其他错误，照常抛出
             raise e
-    # ================= 修复结束 =================
 
+    # 缩放学习率
     _scale_optimizer_lr(gaussians.optimizer, lr_scale)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -74,6 +74,7 @@ def training_co_adapt(dataset, opt, pipe, load_iter: int, co_iters: int, save_ev
     pbar = tqdm(range(load_iter + 1, opt.iterations + 1), desc=f"Co-adapt from {load_iter} (+{co_iters})")
 
     for iteration in pbar:
+        # 这里可能会调用 self.pretrained_exposures，现在我们已经补上了
         gaussians.update_learning_rate(iteration)
 
         if not viewpoint_stack or len(viewpoint_stack) == 0:
@@ -81,8 +82,7 @@ def training_co_adapt(dataset, opt, pipe, load_iter: int, co_iters: int, save_ev
 
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
 
-        # 渲染
-        # 【关键】强制 use_trained_exp=False，确保不会用到我们造的假参数
+        # 渲染 (强制关闭 exposure)
         render_pkg = render(
             viewpoint_cam,
             gaussians,
