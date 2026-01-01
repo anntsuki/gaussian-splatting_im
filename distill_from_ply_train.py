@@ -77,7 +77,8 @@ def truncate_features_rest(fr: torch.Tensor, k: int, coeff_axis: int, mode: str)
 
 
 @torch.no_grad()
-def auto_choose_truncation(student: GaussianModel, teacher: GaussianModel, cams, pipe, background, use_exp: bool, target_sh: int, n_probe: int = 5):
+def auto_choose_truncation(student: GaussianModel, teacher: GaussianModel, cams, pipe, background,
+                           use_exp: bool, target_sh: int, n_probe: int = 5):
     """
     在 head vs tail 两种截断方式中，选一个让 student 初始渲染更像 teacher 的。
     返回 chosen_mode in {"head","tail"}，并把 student._features_rest 设置为 chosen 截断结果。
@@ -86,34 +87,40 @@ def auto_choose_truncation(student: GaussianModel, teacher: GaussianModel, cams,
     fr = student._features_rest
     coeff_axis = detect_coeff_axis(fr)
 
-    if (fr.shape[coeff_axis] < k):
+    if fr.shape[coeff_axis] < k:
         raise RuntimeError(f"coeff dim too small: shape={tuple(fr.shape)}, coeff_axis={coeff_axis}, need={k}")
 
-    # prepare probes
-    picks = []
-    for _ in range(min(n_probe, len(cams))):
-        picks.append(cams[randint(0, len(cams) - 1)])
+    # 随机挑一些相机做探测
+    picks = [cams[randint(0, len(cams) - 1)] for _ in range(min(n_probe, len(cams)))]
 
-    # evaluate head
+    def psnr_scalar(a, b):
+        """兼容 psnr 返回多元素 tensor 的情况"""
+        v = psnr(torch.clamp(a, 0, 1), torch.clamp(b, 0, 1))
+        if isinstance(v, torch.Tensor):
+            return float(v.mean().item())   # <- 关键：mean 成标量
+        return float(v)
+
+    # ---- evaluate head
     fr_head = truncate_features_rest(fr, k, coeff_axis, "head")
     student._features_rest = torch.nn.Parameter(fr_head)
     psnrs_head = []
     for cam in picks:
         t = render(cam, teacher, pipe, background, use_trained_exp=use_exp)["render"].detach()
         s = render(cam, student, pipe, background, use_trained_exp=use_exp)["render"].detach()
-        psnrs_head.append(float(psnr(s, t)))
+        psnrs_head.append(psnr_scalar(s, t))
     mean_head = sum(psnrs_head) / len(psnrs_head)
 
-    # evaluate tail
+    # ---- evaluate tail
     fr_tail = truncate_features_rest(fr, k, coeff_axis, "tail")
     student._features_rest = torch.nn.Parameter(fr_tail)
     psnrs_tail = []
     for cam in picks:
         t = render(cam, teacher, pipe, background, use_trained_exp=use_exp)["render"].detach()
         s = render(cam, student, pipe, background, use_trained_exp=use_exp)["render"].detach()
-        psnrs_tail.append(float(psnr(s, t)))
+        psnrs_tail.append(psnr_scalar(s, t))
     mean_tail = sum(psnrs_tail) / len(psnrs_tail)
 
+    # ---- choose better
     if mean_head >= mean_tail:
         student._features_rest = torch.nn.Parameter(fr_head)
         chosen = "head"
@@ -125,6 +132,7 @@ def auto_choose_truncation(student: GaussianModel, teacher: GaussianModel, cams,
 
     print(f"[AUTO] truncation choose={chosen} (PSNR vs teacher: head={mean_head:.3f}, tail={mean_tail:.3f}, best={best:.3f})")
     return chosen
+
 
 
 def main():
