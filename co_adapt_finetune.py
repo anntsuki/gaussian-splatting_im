@@ -44,7 +44,7 @@ def training_co_adapt(dataset, opt, pipe, load_iter: int, co_iters: int, save_ev
     except AttributeError as e:
         # 如果报错缺少 _exposure
         if "_exposure" in str(e):
-            print("[WARN] Model missing '_exposure'. Injecting dummy attributes to bypass error.")
+            print("[WARN] Model missing exposure attributes. Injecting dummies to bypass error.")
 
             # 1. 强制关闭 Dataset 和 Option 中的曝光开关
             if hasattr(dataset, "train_test_exp"):
@@ -55,11 +55,14 @@ def training_co_adapt(dataset, opt, pipe, load_iter: int, co_iters: int, save_ev
             # 2. 注入假的 exposure 参数
             gaussians._exposure = torch.nn.Parameter(torch.zeros(1, device="cuda"))
 
-            # 3. 【关键新增】注入 pretrained_exposures 属性
-            # update_learning_rate 会检查这个属性，如果没有就会报错
+            # 3. 注入 pretrained_exposures 属性
             gaussians.pretrained_exposures = None
 
-            # 4. 再次尝试 setup
+            # 4. 【关键新增】注入 exposure_mapping，给一个空字典
+            # 这样 save() 函数在循环时会直接跳过，不会报错
+            gaussians.exposure_mapping = {}
+
+            # 5. 再次尝试 setup
             gaussians.training_setup(opt)
         else:
             raise e
@@ -74,7 +77,6 @@ def training_co_adapt(dataset, opt, pipe, load_iter: int, co_iters: int, save_ev
     pbar = tqdm(range(load_iter + 1, opt.iterations + 1), desc=f"Co-adapt from {load_iter} (+{co_iters})")
 
     for iteration in pbar:
-        # 这里可能会调用 self.pretrained_exposures，现在我们已经补上了
         gaussians.update_learning_rate(iteration)
 
         if not viewpoint_stack or len(viewpoint_stack) == 0:
