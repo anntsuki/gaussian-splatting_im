@@ -138,28 +138,22 @@ def main():
 
     # freeze geometry, train SH only
     if hasattr(student, "_xyz"): student._xyz.requires_grad_(False)
+    if hasattr(student, "_scaling"): student._scaling.requires_grad_(False)
+    if hasattr(student, "_rotation"): student._rotation.requires_grad_(False)
     if hasattr(student, "_opacity"): student._opacity.requires_grad_(False)
 
-    # 解冻这两个！让形状参与微调
-    student._scaling.requires_grad_(True)
-    student._rotation.requires_grad_(True)
-
-    # 解冻颜色
+    # 只训练颜色
     student._features_dc.requires_grad_(True)
     student._features_rest.requires_grad_(True)
 
-    # 设置不同的学习率
-    # SH 颜色保持标准学习率
-    # Scaling/Rotation 给一个极小的学习率 (微调，不要剧烈变形)
-    optim = torch.optim.Adam([
-        {"params": [student._features_dc], "lr": args.lr_sh},
-        {"params": [student._features_rest], "lr": args.lr_sh},
-        {"params": [student._scaling], "lr": 0.001},  # 几何微调 LR
-        {"params": [student._rotation], "lr": 0.001}  # 几何微调 LR
-    ])
+    # 这里的 lr 用标准的 0.0025 会稳一点
+    optim = torch.optim.Adam(
+        [{"params": [student._features_dc], "lr": args.lr_sh},
+         {"params": [student._features_rest], "lr": args.lr_sh}]
+    )
 
-    print(f"[INFO] Start AGC Distill: target_sh={args.new_max_sh}, iters={args.iters}")
-    print(f"[INFO] Strategy: Locked XYZ/Opacity, Fine-tuning Color + Scale + Rot")
+    print(f"[INFO] Start distill: target_sh={args.new_max_sh}, iters={args.iters}, lr={args.lr_sh}")
+
     pbar = tqdm(range(1, args.iters + 1), desc="Distill SH")
     for step in pbar:
         # 随机选相机
