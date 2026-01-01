@@ -44,99 +44,50 @@ def get_gt_image(cam):
 
 
 @torch.no_grad()
-def detect_coeff_axis(fr: torch.Tensor) -> int:
+def force_truncate_sh(student: GaussianModel, target_sh: int):
     """
-    fr is [N, ?, ?], one axis is RGB=3, the other is coeff K
-    return coeff_axis (1 or 2)
+    【修复核心】强制截断 SH 系数，保留低频部分，并更新模型属性。
     """
+    target_k = sh_rest_dim(target_sh)
+    fr = student._features_rest
+
+    # 检测维度: [N, K, 3] or [N, 3, K]
     if fr.ndim != 3:
         raise RuntimeError(f"features_rest should be 3D, got {tuple(fr.shape)}")
-    if fr.shape[1] == 3 and fr.shape[2] != 3:
-        return 2  # [N,3,K]
-    if fr.shape[2] == 3 and fr.shape[1] != 3:
-        return 1  # [N,K,3]
-    # fallback: choose larger as coeff axis
-    return 1 if fr.shape[1] > fr.shape[2] else 2
 
+    # 判定哪个轴是 SH 系数轴
+    if fr.shape[1] > fr.shape[2]:
+        coeff_axis = 1
+    else:
+        coeff_axis = 2
 
-@torch.no_grad()
-def truncate_features_rest(fr: torch.Tensor, k: int, coeff_axis: int, mode: str) -> torch.Tensor:
-    """
-    mode: "head" keep first k coeffs; "tail" keep last k coeffs
-    """
+    current_k = fr.shape[coeff_axis]
+
+    if current_k <= target_k:
+        print(f"[WARNING] Student SH dim ({current_k}) is already <= target ({target_k}). Skip truncation.")
+        # 即使维度没变，也要确保 active_degree 是对的
+        student.max_sh_degree = target_sh
+        student.active_sh_degree = target_sh
+        return
+
+    print(f"[INFO] Truncating SH from {current_k} to {target_k} channels (Keeping Head)...")
+
+    # 只取前 target_k 个系数 (低频信息)
     if coeff_axis == 1:
-        if mode == "head":
-            return fr[:, :k, :].contiguous()
-        else:
-            return fr[:, -k:, :].contiguous()
+        new_fr = fr[:, :target_k, :].contiguous()
     else:
-        if mode == "head":
-            return fr[:, :, :k].contiguous()
-        else:
-            return fr[:, :, -k:].contiguous()
+        new_fr = fr[:, :, :target_k].contiguous()
 
+    # 更新参数
+    student._features_rest = torch.nn.Parameter(new_fr)
 
-@torch.no_grad()
-def auto_choose_truncation(student: GaussianModel, teacher: GaussianModel, cams, pipe, background,
-                           use_exp: bool, target_sh: int, n_probe: int = 5):
-    """
-    在 head vs tail 两种截断方式中，选一个让 student 初始渲染更像 teacher 的。
-    返回 chosen_mode in {"head","tail"}，并把 student._features_rest 设置为 chosen 截断结果。
-    """
-    k = sh_rest_dim(target_sh)
-    fr = student._features_rest
-    coeff_axis = detect_coeff_axis(fr)
-
-    if fr.shape[coeff_axis] < k:
-        raise RuntimeError(f"coeff dim too small: shape={tuple(fr.shape)}, coeff_axis={coeff_axis}, need={k}")
-
-    # 随机挑一些相机做探测
-    picks = [cams[randint(0, len(cams) - 1)] for _ in range(min(n_probe, len(cams)))]
-
-    def psnr_scalar(a, b):
-        """兼容 psnr 返回多元素 tensor 的情况"""
-        v = psnr(torch.clamp(a, 0, 1), torch.clamp(b, 0, 1))
-        if isinstance(v, torch.Tensor):
-            return float(v.mean().item())   # <- 关键：mean 成标量
-        return float(v)
-
-    # ---- evaluate head
-    fr_head = truncate_features_rest(fr, k, coeff_axis, "head")
-    student._features_rest = torch.nn.Parameter(fr_head)
-    psnrs_head = []
-    for cam in picks:
-        t = render(cam, teacher, pipe, background, use_trained_exp=use_exp)["render"].detach()
-        s = render(cam, student, pipe, background, use_trained_exp=use_exp)["render"].detach()
-        psnrs_head.append(psnr_scalar(s, t))
-    mean_head = sum(psnrs_head) / len(psnrs_head)
-
-    # ---- evaluate tail
-    fr_tail = truncate_features_rest(fr, k, coeff_axis, "tail")
-    student._features_rest = torch.nn.Parameter(fr_tail)
-    psnrs_tail = []
-    for cam in picks:
-        t = render(cam, teacher, pipe, background, use_trained_exp=use_exp)["render"].detach()
-        s = render(cam, student, pipe, background, use_trained_exp=use_exp)["render"].detach()
-        psnrs_tail.append(psnr_scalar(s, t))
-    mean_tail = sum(psnrs_tail) / len(psnrs_tail)
-
-    # ---- choose better
-    if mean_head >= mean_tail:
-        student._features_rest = torch.nn.Parameter(fr_head)
-        chosen = "head"
-        best = mean_head
-    else:
-        student._features_rest = torch.nn.Parameter(fr_tail)
-        chosen = "tail"
-        best = mean_tail
-
-    print(f"[AUTO] truncation choose={chosen} (PSNR vs teacher: head={mean_head:.3f}, tail={mean_tail:.3f}, best={best:.3f})")
-    return chosen
-
+    # 【关键】必须更新这两个属性，否则光栅化器会读错显存导致花屏
+    student.max_sh_degree = target_sh
+    student.active_sh_degree = target_sh
 
 
 def main():
-    parser = ArgumentParser("SH distillation from PLY (no .pth), robust truncation + GT")
+    parser = ArgumentParser("SH distillation from PLY")
     lp = ModelParams(parser)
     pp = PipelineParams(parser)
 
@@ -144,9 +95,9 @@ def main():
     parser.add_argument("--iteration", type=int, default=30000)
     parser.add_argument("--save_iteration", type=int, default=30000)
 
-    parser.add_argument("--new_max_sh", type=int, default=2, choices=[1,2,3])
-    parser.add_argument("--iters", type=int, default=12000)
-    parser.add_argument("--lr_sh", type=float, default=3e-3)
+    parser.add_argument("--new_max_sh", type=int, default=2, choices=[1, 2, 3])
+    parser.add_argument("--iters", type=int, default=2000)  # 建议2000次够了
+    parser.add_argument("--lr_sh", type=float, default=0.0025)  # 标准 3DGS 学习率
     parser.add_argument("--lambda_dssim", type=float, default=0.2)
     parser.add_argument("--w_gt", type=float, default=0.7)
 
@@ -172,69 +123,63 @@ def main():
     teacher = GaussianModel(teacher_ds.sh_degree)
     teacher_scene = Scene(teacher_ds, teacher, load_iteration=args.iteration, shuffle=False)
 
-    # ---- load student from same PLY, then down-sh
+    # ---- load student from same PLY
     student = GaussianModel(teacher_ds.sh_degree)
     _ = Scene(teacher_ds, student, load_iteration=args.iteration, shuffle=False)
 
     use_exp = getattr(dataset, "train_test_exp", False)
 
-    # prefer onedownSHdegree if exists
-    with torch.no_grad():
-        if hasattr(student, "onedownSHdegree"):
-            try:
-                student.max_sh_degree = args.new_max_sh
-            except Exception:
-                pass
-            for _ in range(3):
-                try:
-                    student.onedownSHdegree()
-                except Exception:
-                    break
-
     cams = teacher_scene.getTrainCameras()
     assert len(cams) > 0, "No train cameras"
 
-    # critical: choose correct truncation order (head vs tail)
+    # 【修复】强制截断并更新 Degree
     with torch.no_grad():
-        auto_choose_truncation(student, teacher, cams, pipe, background, use_exp, args.new_max_sh, n_probe=5)
+        force_truncate_sh(student, args.new_max_sh)
 
     # freeze geometry, train SH only
     if hasattr(student, "_xyz"): student._xyz.requires_grad_(False)
     if hasattr(student, "_scaling"): student._scaling.requires_grad_(False)
     if hasattr(student, "_rotation"): student._rotation.requires_grad_(False)
     if hasattr(student, "_opacity"): student._opacity.requires_grad_(False)
+
+    # 只训练颜色
     student._features_dc.requires_grad_(True)
     student._features_rest.requires_grad_(True)
 
+    # 这里的 lr 用标准的 0.0025 会稳一点
     optim = torch.optim.Adam(
         [{"params": [student._features_dc], "lr": args.lr_sh},
          {"params": [student._features_rest], "lr": args.lr_sh}]
     )
 
-    print(f"[INFO] Start distill: iters={args.iters}, lr_sh={args.lr_sh}, w_gt={args.w_gt}, pseudo={args.augmented_view}")
+    print(f"[INFO] Start distill: target_sh={args.new_max_sh}, iters={args.iters}, lr={args.lr_sh}")
 
     pbar = tqdm(range(1, args.iters + 1), desc="Distill SH")
     for step in pbar:
-        cam_org = cams[randint(0, len(cams) - 1)]
+        # 随机选相机
+        cam_idx = randint(0, len(cams) - 1)
+        cam_org = cams[cam_idx]
         cam = copy.deepcopy(cam_org)
 
-        # pseudo late + controlled frequency
+        # pseudo data augmentation
         use_pseudo = False
         if args.augmented_view and step > int(args.iters * args.pseudo_start_ratio):
             use_pseudo = (step % args.pv_every != 0)
         if use_pseudo:
             cam = gaussian_poses(cam, mean=0, std_dev_translation=args.pv_trans, std_dev_rotation=args.pv_rot)
 
+        # Forward Teacher
         with torch.no_grad():
             t_img = render(cam, teacher, pipe, background, use_trained_exp=use_exp)["render"].detach()
 
+        # Forward Student
         s_img = render(cam, student, pipe, background, use_trained_exp=use_exp)["render"]
 
-        # teacher distill
+        # Loss 1: Teacher Distillation
         l1_t = l1_loss(s_img, t_img)
         loss = (1.0 - args.lambda_dssim) * l1_t + args.lambda_dssim * (1.0 - ssim(s_img, t_img))
 
-        # GT only on real view
+        # Loss 2: GT Supervision (Only on real views)
         if not use_pseudo:
             gt = get_gt_image(cam_org)
             if gt is not None:
@@ -248,10 +193,10 @@ def main():
         optim.step()
 
         if step % 50 == 0:
-            pbar.set_postfix(loss=float(loss.item()), l1_teacher=float(l1_t.item()), pseudo=int(use_pseudo))
+            pbar.set_postfix(loss=float(loss.item()), l1_teacher=float(l1_t.item()))
 
     # ---- save output
-    out_dir = args.model_path
+    out_dir = args.model_path  # 这里的 model_path 其实是 output path
     ensure_dir(out_dir)
 
     # copy meta files
