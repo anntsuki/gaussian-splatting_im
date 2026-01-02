@@ -23,26 +23,47 @@ def backup_to_temp(ply_path: str, tag: str):
     shutil.copy2(ply_path, bak)
     return bak
 
+
 def write_ply(path: str, pos, nrm, dc, rest, opacity, scale, rot):
+    # --- 修改开始：自动填充 SH 系数以满足 GaussianModel 的检查 ---
+    # 你的压缩只保留了 SH=1 (9个系数)，但 GaussianModel 通常配置为 SH=3 (45个系数)
+    # 我们需要补 0 凑齐 45 个，否则 load_ply 会报错 AssertionError
+
+    current_dim = rest.shape[1]
+    # 目标维度：SH3 = 45, SH2 = 24. 默认按标准 3DGS 补齐到 45
+    target_sh_degree = 3
+    target_dim = 3 * (target_sh_degree + 1) ** 2 - 3  # 45
+
+    if current_dim < target_dim:
+        print(f"[WARN] Padding SH coeffs from {current_dim} to {target_dim} to match SH={target_sh_degree} config.")
+        padding = np.zeros((rest.shape[0], target_dim - current_dim), dtype=np.float32)
+        rest = np.concatenate([rest, padding], axis=1)
+    # --- 修改结束 ---
+
     N = pos.shape[0]
     dtype = [
-        ("x","f4"),("y","f4"),("z","f4"),
-        ("nx","f4"),("ny","f4"),("nz","f4"),
-        ("f_dc_0","f4"),("f_dc_1","f4"),("f_dc_2","f4"),
-    ] + [(f"f_rest_{i}","f4") for i in range(rest.shape[1])] + [
-        ("opacity","f4"),
-        ("scale_0","f4"),("scale_1","f4"),("scale_2","f4"),
-        ("rot_0","f4"),("rot_1","f4"),("rot_2","f4"),("rot_3","f4"),
-    ]
+                ("x", "f4"), ("y", "f4"), ("z", "f4"),
+                ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),
+                ("f_dc_0", "f4"), ("f_dc_1", "f4"), ("f_dc_2", "f4"),
+            ] + [(f"f_rest_{i}", "f4") for i in range(rest.shape[1])] + [
+                ("opacity", "f4"),
+                ("scale_0", "f4"), ("scale_1", "f4"), ("scale_2", "f4"),
+                ("rot_0", "f4"), ("rot_1", "f4"), ("rot_2", "f4"), ("rot_3", "f4"),
+            ]
+
     arr = np.empty(N, dtype=np.dtype(dtype))
-    arr["x"], arr["y"], arr["z"] = pos[:,0], pos[:,1], pos[:,2]
-    arr["nx"], arr["ny"], arr["nz"] = nrm[:,0], nrm[:,1], nrm[:,2]
-    arr["f_dc_0"], arr["f_dc_1"], arr["f_dc_2"] = dc[:,0], dc[:,1], dc[:,2]
+    arr["x"], arr["y"], arr["z"] = pos[:, 0], pos[:, 1], pos[:, 2]
+    arr["nx"], arr["ny"], arr["nz"] = nrm[:, 0], nrm[:, 1], nrm[:, 2]
+    arr["f_dc_0"], arr["f_dc_1"], arr["f_dc_2"] = dc[:, 0], dc[:, 1], dc[:, 2]
+
+    # 这里的循环会自动处理补齐后的所有系数
     for i in range(rest.shape[1]):
         arr[f"f_rest_{i}"] = rest[:, i]
-    arr["opacity"] = opacity[:,0]
-    arr["scale_0"], arr["scale_1"], arr["scale_2"] = scale[:,0], scale[:,1], scale[:,2]
-    arr["rot_0"], arr["rot_1"], arr["rot_2"], arr["rot_3"] = rot[:,0], rot[:,1], rot[:,2], rot[:,3]
+
+    arr["opacity"] = opacity[:, 0]
+    arr["scale_0"], arr["scale_1"], arr["scale_2"] = scale[:, 0], scale[:, 1], scale[:, 2]
+    arr["rot_0"], arr["rot_1"], arr["rot_2"], arr["rot_3"] = rot[:, 0], rot[:, 1], rot[:, 2], rot[:, 3]
+
     el = PlyElement.describe(arr, "vertex")
     PlyData([el], text=False).write(path)
 
