@@ -5,7 +5,6 @@ import numpy as np
 import torch
 from plyfile import PlyData
 
-# ---------- find latest ply ----------
 def find_latest_iter_ply(model_path: str):
     cand = glob.glob(os.path.join(model_path, "point_cloud", "iteration_*", "point_cloud.ply"))
     if not cand:
@@ -15,11 +14,9 @@ def find_latest_iter_ply(model_path: str):
         return int(m.group(1)) if m else -1
     cand.sort(key=itnum)
     ply_path = cand[-1]
-    iter_num = itnum(ply_path)
     iter_dir = os.path.dirname(ply_path)
-    return ply_path, iter_dir, iter_num
+    return ply_path, iter_dir, itnum(ply_path)
 
-# ---------- ply read ----------
 def read_ply(path: str):
     ply = PlyData.read(path)
     v = ply["vertex"].data
@@ -31,8 +28,6 @@ def read_ply(path: str):
         return np.asarray(v[name], dtype=np.float32)
 
     pos = np.stack([get("x"), get("y"), get("z")], axis=1)
-
-    # normals optional
     if all(n in names for n in ["nx", "ny", "nz"]):
         nrm = np.stack([get("nx"), get("ny"), get("nz")], axis=1)
     else:
@@ -49,10 +44,8 @@ def read_ply(path: str):
     opacity = get("opacity")[:, None]
     scale = np.stack([get("scale_0"), get("scale_1"), get("scale_2")], axis=1)
     rot = np.stack([get("rot_0"), get("rot_1"), get("rot_2"), get("rot_3")], axis=1)
-
     return pos, nrm, dc, rest, opacity, scale, rot
 
-# ---------- quant helpers ----------
 def quant_minmax(x: np.ndarray, bits: int = 8):
     qmax = (1 << bits) - 1
     x = x.astype(np.float32)
@@ -77,7 +70,7 @@ def quant_quat(rot: np.ndarray, bits: int = 16):
         raise ValueError("rot_bits must be 8 or 16")
     return q, np.int32(bits)
 
-# ---------- morton sort (improves deflate) ----------
+# morton sort (better deflate)
 def _part1by2(n):
     n = (n | (n << 16)) & 0x030000FF
     n = (n | (n << 8))  & 0x0300F00F
@@ -97,27 +90,23 @@ def morton_sort(pos: np.ndarray, bits: int = 10):
     code = morton3D(grid[:,0], grid[:,1], grid[:,2])
     return np.argsort(code, kind="stable")
 
-# ---------- kmeans ----------
 @torch.no_grad()
 def kmeans_torch(x: torch.Tensor, K: int, iters: int, seed: int):
     g = torch.Generator(device=x.device)
     g.manual_seed(seed)
-
     N, D = x.shape
     idx = torch.randint(0, N, (K,), generator=g, device=x.device)
-    c = x[idx].clone()  # [K,D]
-
+    c = x[idx].clone()
     bs = 200000
     for _ in range(iters):
-        x2 = (x * x).sum(dim=1, keepdim=True)  # [N,1]
-        c2 = (c * c).sum(dim=1).view(1, K)     # [1,K]
+        x2 = (x * x).sum(dim=1, keepdim=True)
+        c2 = (c * c).sum(dim=1).view(1, K)
         labels = []
         for s in range(0, N, bs):
             xb = x[s:s+bs]
             d2 = x2[s:s+bs] + c2 - 2.0 * xb @ c.t()
             labels.append(torch.argmin(d2, dim=1))
         labels = torch.cat(labels, dim=0)
-
         c.zero_()
         counts = torch.zeros((K,), device=x.device, dtype=torch.float32)
         c.index_add_(0, labels, x)
@@ -125,7 +114,6 @@ def kmeans_torch(x: torch.Tensor, K: int, iters: int, seed: int):
         counts.index_add_(0, labels, ones)
         counts = torch.clamp(counts, min=1.0)
         c = c / counts[:, None]
-
     return c
 
 def build_codebook(vec: np.ndarray, K: int, sample: int, iters: int, device: str, seed: int):
@@ -136,15 +124,11 @@ def build_codebook(vec: np.ndarray, K: int, sample: int, iters: int, device: str
         train = vec[sel]
     else:
         train = vec
-
     xt = torch.from_numpy(train).to(device=device, dtype=torch.float32)
     cent = kmeans_torch(xt, K=K, iters=iters, seed=seed)  # [K,4]
-
-    # assign all
     xfull = torch.from_numpy(vec).to(device=device, dtype=torch.float32)
     x2 = (xfull * xfull).sum(dim=1, keepdim=True)
     c2 = (cent * cent).sum(dim=1).view(1, K)
-
     bs = 200000
     idxs = []
     for s in range(0, N, bs):
@@ -152,10 +136,8 @@ def build_codebook(vec: np.ndarray, K: int, sample: int, iters: int, device: str
         d2 = x2[s:s+bs] + c2 - 2.0 * xb @ cent.t()
         idxs.append(torch.argmin(d2, dim=1).cpu().numpy())
     idxs = np.concatenate(idxs, axis=0).astype(np.uint16 if K > 256 else np.uint8)
-
     return cent.cpu().numpy().astype(np.float16), idxs
 
-# ---------- main ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", required=True)
@@ -176,7 +158,7 @@ def main():
     N = pos.shape[0]
     print(f"[ENC] gaussians   = {N}")
 
-    # L1 layout: rest = [R(3),G(3),B(3)], per-channel vec = [dc, l1(3)] => 4D
+    # L1 layout: rest=[R(3),G(3),B(3)], per-channel vec=[dc, l1(3)] => 4D
     r = np.concatenate([dc[:,0:1], rest[:,0:3]], axis=1)
     g = np.concatenate([dc[:,1:2], rest[:,3:6]], axis=1)
     b = np.concatenate([dc[:,2:3], rest[:,6:9]], axis=1)
@@ -201,16 +183,11 @@ def main():
     out_npz = os.path.join(iter_dir, f"point_cloud.{args.tag}.npz")
     np.savez_compressed(
         out_npz,
-        # meta
         degree=np.int32(1),
         K=np.int32(args.K),
         morton_used=np.int32(0 if args.no_morton else 1),
-
-        # codebooks + indices
         cb_r=cb_r, cb_g=cb_g, cb_b=cb_b,
         idx_r=ap(idx_r), idx_g=ap(idx_g), idx_b=ap(idx_b),
-
-        # other params
         pos16=ap(pos16),
         nrm16=ap(nrm16),
         op_q=ap(op_q), op_mn=op_mn, op_mx=op_mx, op_bits=op_bits,

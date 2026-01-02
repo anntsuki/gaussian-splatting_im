@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, re, glob, argparse, shutil, time
+import os, re, glob, argparse, shutil, time, subprocess, sys
 import numpy as np
 from plyfile import PlyData, PlyElement
 
@@ -15,17 +15,12 @@ def find_latest_iter_dir(model_path: str):
     cand.sort(key=itnum)
     return cand[-1], itnum(cand[-1])
 
-def backup_file(path: str):
-    if not os.path.exists(path):
-        return None
-    # 如果已有 .bak，就加时间戳避免覆盖
-    base = path + ".bak"
-    if not os.path.exists(base):
-        shutil.copy2(path, base)
-        return base
+def backup_to_temp(ply_path: str, tag: str):
+    if not os.path.exists(ply_path):
+        raise FileNotFoundError(f"PLY not found: {ply_path}")
     ts = time.strftime("%Y%m%d_%H%M%S")
-    bak = f"{base}.{ts}"
-    shutil.copy2(path, bak)
+    bak = ply_path + f".bak_eval_{tag}_{ts}"
+    shutil.copy2(ply_path, bak)
     return bak
 
 def write_ply(path: str, pos, nrm, dc, rest, opacity, scale, rot):
@@ -64,40 +59,12 @@ def dequant_quat(q: np.ndarray, bits: int):
     n[n < 1e-12] = 1.0
     return rot / n
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model_path", required=True)
-    ap.add_argument("--tag", default="cb256")
-    ap.add_argument("--npz", default=None, help="optional explicit npz path (otherwise auto: latest_iter/point_cloud.<tag>.npz)")
-    ap.add_argument("--no_backup", action="store_true")
-    args = ap.parse_args()
-
-    iter_dir, itnum = find_latest_iter_dir(args.model_path)
-    print(f"[DEC] latest iter = {itnum}")
-    print(f"[DEC] iter dir    = {iter_dir}")
-
-    npz_path = args.npz if args.npz else os.path.join(iter_dir, f"point_cloud.{args.tag}.npz")
-    if not os.path.exists(npz_path):
-        raise FileNotFoundError(f"Cannot find npz: {npz_path}")
-
-    ply_path = os.path.join(iter_dir, "point_cloud.ply")
-    print(f"[DEC] use npz     = {npz_path}")
-    print(f"[DEC] target ply  = {ply_path}")
-
-    if not args.no_backup:
-        bak = backup_file(ply_path)
-        if bak:
-            print(f"[DEC] backup ply = {bak}")
-        else:
-            print("[DEC] backup ply = (no original ply found)")
-
+def decode_npz_to_ply_inplace(npz_path: str, ply_path: str):
     z = np.load(npz_path, allow_pickle=False)
-    K = int(z["K"])
 
     cb_r = z["cb_r"].astype(np.float32)
     cb_g = z["cb_g"].astype(np.float32)
     cb_b = z["cb_b"].astype(np.float32)
-
     idx_r = z["idx_r"].astype(np.int64)
     idx_g = z["idx_g"].astype(np.int64)
     idx_b = z["idx_b"].astype(np.int64)
@@ -111,13 +78,82 @@ def main():
 
     pos = z["pos16"].astype(np.float32)
     nrm = z["nrm16"].astype(np.float32) if "nrm16" in z else np.zeros_like(pos)
-
     opacity = dequant_minmax(z["op_q"], z["op_mn"], z["op_mx"], int(z["op_bits"])).astype(np.float32)
     scale   = dequant_minmax(z["sc_q"], z["sc_mn"], z["sc_mx"], int(z["sc_bits"])).astype(np.float32)
     rot     = dequant_quat(z["rot_q"], int(z["rot_bits"])).astype(np.float32)
 
-    write_ply(ply_path, pos, nrm, dc, rest, opacity, scale, rot)
-    print("[DEC] wrote ply   = OK (overwritten point_cloud.ply)")
+    # 写到临时文件，再原子替换
+    tmp = ply_path + ".tmp_decode"
+    write_ply(tmp, pos, nrm, dc, rest, opacity, scale, rot)
+    os.replace(tmp, ply_path)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model_path", required=True)
+    ap.add_argument("--tag", default="cb256")
+    ap.add_argument("--bench", default="benchmark_fps.py", help="path to benchmark_fps.py")
+    ap.add_argument("--keep_backup", action="store_true", help="keep backup file after restore")
+
+    # 下面这些就是你平时 benchmark_fps.py 用的参数（常用的我都写了）
+    ap.add_argument("-s", "--source_path", required=True)
+    ap.add_argument("--iteration", type=int, default=0)
+    ap.add_argument("--split", default="test")
+    ap.add_argument("--n_views", type=int, default=50)
+    ap.add_argument("--out_json", default=None)
+
+    args, extra = ap.parse_known_args()  # 允许你额外传 benchmark_fps.py 的其他参数
+
+    iter_dir, itnum = find_latest_iter_dir(args.model_path)
+    ply_path = os.path.join(iter_dir, "point_cloud.ply")
+    npz_path = os.path.join(iter_dir, f"point_cloud.{args.tag}.npz")
+
+    if not os.path.exists(npz_path):
+        raise FileNotFoundError(f"NPZ not found: {npz_path} (did you run gs_encode.py with tag={args.tag}?)")
+
+    # 默认 out_json：同目录下自动生成
+    out_json = args.out_json
+    if out_json is None:
+        out_json = os.path.join(iter_dir, f"bench_{args.tag}.json")
+
+    print(f"[EVAL] latest iter = {itnum}")
+    print(f"[EVAL] npz         = {npz_path}")
+    print(f"[EVAL] ply         = {ply_path}")
+    print(f"[EVAL] bench       = {args.bench}")
+    print(f"[EVAL] out_json    = {out_json}")
+
+    bak = backup_to_temp(ply_path, args.tag)
+    print(f"[EVAL] backup ->   = {bak}")
+
+    try:
+        print("[EVAL] decoding npz -> point_cloud.ply ...")
+        decode_npz_to_ply_inplace(npz_path, ply_path)
+
+        cmd = [
+            sys.executable, args.bench,
+            "-m", args.model_path,
+            "-s", args.source_path,
+            "--iteration", str(args.iteration),
+            "--split", args.split,
+            "--n_views", str(args.n_views),
+            "--out_json", out_json
+        ] + extra
+
+        print("[EVAL] running benchmark:")
+        print("       " + " ".join(cmd))
+        ret = subprocess.run(cmd, check=False)
+        if ret.returncode != 0:
+            print(f"[EVAL] benchmark exited with code {ret.returncode}")
+            sys.exit(ret.returncode)
+
+        print("[EVAL] benchmark done.")
+    finally:
+        # 不管 benchmark 成功失败，都恢复
+        if os.path.exists(bak):
+            os.replace(bak, ply_path)
+            print("[EVAL] restored original point_cloud.ply")
+            if not args.keep_backup:
+                # 已经 restore 了，bak 文件路径被 replace 掉了，不存在了
+                pass
 
 if __name__ == "__main__":
     main()
