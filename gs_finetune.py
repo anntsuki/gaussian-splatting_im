@@ -201,20 +201,32 @@ def finetune(dataset, opt, pipe, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", required=True)
-    parser.add_argument("--source_path", required=True)
+
+    # --- 修复核心：删除冲突的参数定义 ---
+    # ModelParams 会自动添加 --model_path 和 --source_path，所以这里不能再add了
+    # parser.add_argument("--model_path", required=True)  <-- 删除
+    # parser.add_argument("--source_path", required=True) <-- 删除
+
+    # 只保留脚本特有的参数
     parser.add_argument("--tag", required=True, help="Input NPZ tag (e.g. cb4096)")
     parser.add_argument("--save_path", default=None, help="Output NPZ path (default: overwrite)")
     parser.add_argument("--finetune_iters", type=int, default=2000)
     parser.add_argument("--iteration", type=int, default=30000)
 
-    # 接收标准 3DGS 参数
+    # 加载标准 3DGS 参数 (这里会自动把 -s, -m 加进去)
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
 
     args = parser.parse_args()
 
+    # 检查必要的路径参数 (因为 ModelParams 里可能有默认值，这里手动检查一下更稳)
+    if not args.model_path:
+        parser.error("argument --model_path/-m is required")
+    if not args.source_path:
+        parser.error("argument --source_path/-s is required")
+
+    # 自动生成 save_path
     if args.save_path is None:
         args.save_path = os.path.join(args.model_path, "point_cloud", f"iteration_{args.iteration}",
                                       f"point_cloud.{args.tag}.finetuned.npz")
