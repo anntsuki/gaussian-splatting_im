@@ -77,7 +77,7 @@ def main():
                 sys.executable, SCRIPT_ENCODE,
                 "--model_path", model_path,
                 "--tag", TAG,
-                "--K", "256",  # 码本大小
+                "--K", "4096",  # 码本大小
                 "--sample", "200000",  # 采样数
                 "--no_morton"  # 如果你想用 morton 排序就去掉这行，不去掉就是原来的逻辑
                 # 如果 gs_encode.py 不支持 --no_morton 这种 flag 形式请自行调整，
@@ -91,7 +91,7 @@ def main():
                 sys.executable, SCRIPT_ENCODE,
                 "--model_path", model_path,
                 "--tag", TAG,
-                "--K", "256"
+                "--K", "4096"
             ]
 
             if not run_command(cmd_encode, f"Encoding {scene}"):
