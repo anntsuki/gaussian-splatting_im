@@ -99,6 +99,37 @@ class OptimizationParams(ParamGroup):
         self.optimizer_type = "default"
         super().__init__(parser, "Optimization Parameters")
 
+
+class CompressionParams(ParamGroup):
+    def __init__(self, parser):
+        self.load_iteration = -1
+        self.finetune_iterations = 5000
+
+        self.color_codebook_size = 2 ** 12
+        self.color_importance_include = 0.6 * 1e-6
+        self.color_importance_prune = 0.0
+        self.color_cluster_iterations = 100
+        self.color_decay = 0.8
+        self.color_batch_size = 2 ** 18
+        self.color_weights_per_param = False
+        self.color_compress_non_dir = True
+        self.not_compress_color = False
+
+        self.gaussian_codebook_size = 2 ** 12
+        self.gaussian_importance_include = 0.3 * 1e-5
+        self.gaussian_cluster_iterations = 800
+        self.gaussian_decay = 0.8
+        self.gaussian_batch_size = 2 ** 20
+        self.not_compress_gaussians = False
+        self.not_sort_morton = False
+
+        self.prune_threshold = 0.
+
+        self.output_vq = "./eval_vq"
+        self.start_checkpoint = ""
+        super().__init__(parser, "Compression Parameters")
+
+
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
