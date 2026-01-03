@@ -29,10 +29,11 @@ def finetune(dataset, opt, pipe, args):
     device = "cuda"
 
     # --- 加载 Codebooks (核心优化对象) ---
-    # 自动识别维度 (SH1=4, SH2=9 etc)
-    cb_r = nn.Parameter(torch.from_numpy(data["cb_r"]).to(device).requires_grad_(True))
-    cb_g = nn.Parameter(torch.from_numpy(data["cb_g"]).to(device).requires_grad_(True))
-    cb_b = nn.Parameter(torch.from_numpy(data["cb_b"]).to(device).requires_grad_(True))
+    # --- 加载 Codebooks ---
+    # 必须强转 .float() (即 float32)，否则渲染器会报 "expected Float but found Half"
+    cb_r = nn.Parameter(torch.from_numpy(data["cb_r"]).to(device).float().requires_grad_(True))
+    cb_g = nn.Parameter(torch.from_numpy(data["cb_g"]).to(device).float().requires_grad_(True))
+    cb_b = nn.Parameter(torch.from_numpy(data["cb_b"]).to(device).float().requires_grad_(True))
 
     # --- 加载 Indices (冻结，不可导) ---
     # 注意: Indices 必须是 LongTensor
