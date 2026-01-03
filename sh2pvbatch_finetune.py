@@ -20,7 +20,7 @@ BENCH_PY    = os.path.join(REPO, "benchmark_fps.py")
 FINETUNE_ITERS = 5000          # 微调迭代数（常用 2000~8000）
 N_VIEWS = 50                   # benchmark 视角上限（会被 test set 实际数量截断）
 SPLIT = "test"
-FORCE = False                  # True: 即使输出已存在也重跑；False: 有结果就跳过微调只测评
+FORCE = True                  # True: 即使输出已存在也重跑；False: 有结果就跳过微调只测评
 
 # 防碎片（可选但推荐）
 ENV = os.environ.copy()
