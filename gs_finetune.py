@@ -1,219 +1,231 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import os
-import argparse
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os, re, glob, argparse
 import numpy as np
-from tqdm import tqdm
-from random import randint
-from math import exp
-from torch.autograd import Variable
-
-# 引入 3DGS 核心模块
-from scene import Scene, GaussianModel
-from gaussian_renderer import render
-from arguments import ModelParams, PipelineParams, OptimizationParams
-from utils.loss_utils import l1_loss
+import torch
+from plyfile import PlyData
 
 
-# ================= SSIM 实现 =================
-def gaussian(window_size, sigma):
-    gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
-    return gauss / gauss.sum()
+def find_latest_iter_ply(model_path: str):
+    cand = glob.glob(os.path.join(model_path, "point_cloud", "iteration_*", "point_cloud.ply"))
+    if not cand:
+        raise FileNotFoundError(f"Cannot find point_cloud/iteration_*/point_cloud.ply under {model_path}")
+
+    def itnum(p):
+        m = re.search(r"iteration_(\d+)", p)
+        return int(m.group(1)) if m else -1
+
+    cand.sort(key=itnum)
+    ply_path = cand[-1]
+    iter_dir = os.path.dirname(ply_path)
+    return ply_path, iter_dir, itnum(ply_path)
 
 
-def create_window(window_size, channel):
-    _1D_window = gaussian(window_size, 1.5).unsqueeze(1)
-    window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0)
-    window = Variable(window.expand(channel, 1, window_size, window_size).contiguous())
-    return window
+def read_ply(path: str):
+    ply = PlyData.read(path)
+    v = ply["vertex"].data
+    names = v.dtype.names
 
+    def get(name):
+        if name not in names:
+            raise KeyError(f"Missing field {name} in PLY")
+        return np.asarray(v[name], dtype=np.float32)
 
-def ssim(img1, img2, window_size=11, size_average=True):
-    channel = img1.size(1)
-    window = create_window(window_size, channel)
-    if img1.is_cuda:
-        window = window.cuda(img1.get_device())
-    window = window.type_as(img1)
-
-    mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
-    mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)
-
-    mu1_sq = mu1.pow(2)
-    mu2_sq = mu2.pow(2)
-    mu1_mu2 = mu1 * mu2
-
-    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size // 2, groups=channel) - mu1_sq
-    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size // 2, groups=channel) - mu2_sq
-    sigma12 = F.conv2d(img1 * img2, window, padding=window_size // 2, groups=channel) - mu1_mu2
-
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
-
-    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
-
-    if size_average:
-        return ssim_map.mean()
+    pos = np.stack([get("x"), get("y"), get("z")], axis=1)
+    if all(n in names for n in ["nx", "ny", "nz"]):
+        nrm = np.stack([get("nx"), get("ny"), get("nz")], axis=1)
     else:
-        return ssim_map.mean(1).mean(1).mean(1)
+        nrm = np.zeros_like(pos)
+
+    dc = np.stack([get("f_dc_0"), get("f_dc_1"), get("f_dc_2")], axis=1)
+
+    rest_names = [n for n in names if n.startswith("f_rest_")]
+    rest_names.sort(key=lambda s: int(s.split("_")[-1]))
+    rest = np.stack([get(n) for n in rest_names], axis=1)
+
+    opacity = get("opacity")[:, None]
+    scale = np.stack([get("scale_0"), get("scale_1"), get("scale_2")], axis=1)
+    rot = np.stack([get("rot_0"), get("rot_1"), get("rot_2"), get("rot_3")], axis=1)
+    return pos, nrm, dc, rest, opacity, scale, rot
 
 
-# ============================================================
+def quant_minmax(x: np.ndarray, bits: int = 8):
+    qmax = (1 << bits) - 1
+    x = x.astype(np.float32)
+    mn = x.min(axis=0, keepdims=True)
+    mx = x.max(axis=0, keepdims=True)
+    span = (mx - mn)
+    span[span < 1e-12] = 1.0
+    q = np.round((x - mn) / span * qmax)
+    q = q.astype(np.uint16 if bits > 8 else np.uint8)
+    return q, mn.astype(np.float32), mx.astype(np.float32), np.int32(bits)
 
-def finetune(dataset, opt, pipe, args):
-    iter_dir = os.path.join(args.model_path, "point_cloud", f"iteration_{args.iteration}")
-    npz_path = os.path.join(iter_dir, f"point_cloud.{args.tag}.npz")
 
-    if not os.path.exists(npz_path):
-        raise FileNotFoundError(f"Compressed model not found at {npz_path}")
+def quant_quat(rot: np.ndarray, bits: int = 16):
+    rot = rot.astype(np.float32)
+    n = np.linalg.norm(rot, axis=1, keepdims=True)
+    n[n < 1e-12] = 1.0
+    rot = rot / n
+    if bits == 16:
+        q = np.round(np.clip(rot, -1, 1) * 32767.0).astype(np.int16)
+    elif bits == 8:
+        q = np.round(np.clip(rot, -1, 1) * 127.0).astype(np.int8)
+    else:
+        raise ValueError("rot_bits must be 8 or 16")
+    return q, np.int32(bits)
 
-    print(f"[FT] Loading compressed model from {npz_path}...")
-    data = np.load(npz_path)
 
-    device = "cuda"
+def _part1by2(n):
+    n = (n | (n << 16)) & 0x030000FF
+    n = (n | (n << 8)) & 0x0300F00F
+    n = (n | (n << 4)) & 0x030C30C3
+    n = (n | (n << 2)) & 0x09249249
+    return n
 
-    # 强制转 float32
-    cb_r = nn.Parameter(torch.from_numpy(data["cb_r"]).to(device).float().requires_grad_(True))
-    cb_g = nn.Parameter(torch.from_numpy(data["cb_g"]).to(device).float().requires_grad_(True))
-    cb_b = nn.Parameter(torch.from_numpy(data["cb_b"]).to(device).float().requires_grad_(True))
 
-    idx_r = torch.from_numpy(data["idx_r"].astype(np.int64)).to(device)
-    idx_g = torch.from_numpy(data["idx_g"].astype(np.int64)).to(device)
-    idx_b = torch.from_numpy(data["idx_b"].astype(np.int64)).to(device)
+def morton3D(xi, yi, zi):
+    return (_part1by2(xi) | (_part1by2(yi) << 1) | (_part1by2(zi) << 2)).astype(np.uint32)
 
-    xyz = torch.from_numpy(data["pos16"].astype(np.float32)).to(device)
 
-    rot_q = torch.from_numpy(data["rot_q"]).to(device)
-    rot_bits = int(data["rot_bits"])
-    norm_factor = 32767.0 if rot_bits == 16 else 127.0
-    rot = (rot_q.float() / norm_factor)
-    rot = rot / (rot.norm(dim=1, keepdim=True) + 1e-9)
-    rot = rot.requires_grad_(False)
+def morton_sort(pos: np.ndarray, bits: int = 10):
+    mn = pos.min(axis=0)
+    mx = pos.max(axis=0)
+    span = np.maximum(mx - mn, 1e-12)
+    grid = np.floor((pos - mn) / span * ((1 << bits) - 1)).astype(np.int32)
+    grid = np.clip(grid, 0, (1 << bits) - 1).astype(np.uint32)
+    code = morton3D(grid[:, 0], grid[:, 1], grid[:, 2])
+    return np.argsort(code, kind="stable")
 
-    scale_q = torch.from_numpy(data["sc_q"]).to(device)
-    scale_mn = torch.tensor(data["sc_mn"]).to(device)
-    scale_mx = torch.tensor(data["sc_mx"]).to(device)
-    scale = scale_mn + (scale_mx - scale_mn) * (scale_q.float() / 255.0)
-    scale = scale.requires_grad_(False)
 
-    op_q = torch.from_numpy(data["op_q"]).to(device)
-    op_mn = torch.tensor(data["op_mn"]).to(device)
-    op_mx = torch.tensor(data["op_mx"]).to(device)
-    opacity_val = op_mn + (op_mx - op_mn) * (op_q.float() / 255.0)
-    opacity = nn.Parameter(opacity_val.requires_grad_(True))
+@torch.no_grad()
+def kmeans_torch(x: torch.Tensor, K: int, iters: int, seed: int):
+    g = torch.Generator(device=x.device)
+    g.manual_seed(seed)
+    N, D = x.shape
+    idx = torch.randint(0, N, (K,), generator=g, device=x.device)
+    c = x[idx].clone()
+    bs = 10000  # [FIX] Reduced batch size to prevent OOM
+    for _ in range(iters):
+        x2 = (x * x).sum(dim=1, keepdim=True)
+        c2 = (c * c).sum(dim=1).view(1, K)
+        labels = []
+        for s in range(0, N, bs):
+            xb = x[s:s + bs]
+            d2 = x2[s:s + bs] + c2 - 2.0 * xb @ c.t()
+            labels.append(torch.argmin(d2, dim=1))
+        labels = torch.cat(labels, dim=0)
+        c.zero_()
+        counts = torch.zeros((K,), device=x.device, dtype=torch.float32)
+        c.index_add_(0, labels, x)
+        ones = torch.ones((N,), device=x.device, dtype=torch.float32)
+        counts.index_add_(0, labels, ones)
+        counts = torch.clamp(counts, min=1.0)
+        c = c / counts[:, None]
+    return c
 
-    print(f"[FT] Loaded {xyz.shape[0]} Gaussians.")
 
-    gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians, load_iteration=args.iteration, shuffle=True)
+def build_codebook(vec: np.ndarray, K: int, sample: int, iters: int, device: str, seed: int):
+    N, D = vec.shape
+    if sample > 0 and N > sample:
+        rs = np.random.RandomState(seed)
+        sel = rs.choice(N, size=sample, replace=False)
+        train = vec[sel]
+    else:
+        train = vec
+    xt = torch.from_numpy(train).to(device=device, dtype=torch.float32)
+    cent = kmeans_torch(xt, K=K, iters=iters, seed=seed)
+    xfull = torch.from_numpy(vec).to(device=device, dtype=torch.float32)
+    x2 = (xfull * xfull).sum(dim=1, keepdim=True)
+    c2 = (cent * cent).sum(dim=1).view(1, K)
+    bs = 10000  # [FIX] Reduced batch size
+    idxs = []
+    for s in range(0, N, bs):
+        xb = xfull[s:s + bs]
+        d2 = x2[s:s + bs] + c2 - 2.0 * xb @ cent.t()
+        idxs.append(torch.argmin(d2, dim=1).cpu().numpy())
+    idxs = np.concatenate(idxs, axis=0).astype(np.uint16 if K > 256 else np.uint8)
+    return cent.cpu().numpy().astype(np.float16), idxs
 
-    optimizer = optim.Adam([
-        {'params': [cb_r, cb_g, cb_b], 'lr': 0.005, "name": "codebook"},
-        {'params': [opacity], 'lr': 0.01, "name": "opacity"}
-    ], lr=0.0)
 
-    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device=device)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model_path", required=True)
+    ap.add_argument("--tag", default="cb256")
+    ap.add_argument("--K", type=int, default=256)
+    ap.add_argument("--sample", type=int, default=200000)
+    ap.add_argument("--kmeans_iters", type=int, default=12)
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--rot_bits", type=int, default=16, choices=[8, 16])
+    ap.add_argument("--no_morton", action="store_true")
+    args = ap.parse_args()
 
-    pbar = tqdm(range(args.finetune_iters), desc="Codebook Finetuning")
+    ply_path, iter_dir, itnum = find_latest_iter_ply(args.model_path)
+    print(f"[ENC] latest iter = {itnum}")
+    print(f"[ENC] read ply    = {ply_path}")
 
-    for iteration in pbar:
-        try:
-            viewpoint_cam = scene.getTrainCameras()[randint(0, len(scene.getTrainCameras()) - 1)]
-        except:
-            viewpoint_cam = scene.getTrainCameras()[0]
+    pos, nrm, dc, rest, opacity, scale, rot = read_ply(ply_path)
+    N = pos.shape[0]
+    print(f"[ENC] gaussians   = {N}")
 
-        f_r = torch.index_select(cb_r, 0, idx_r)
-        f_g = torch.index_select(cb_g, 0, idx_g)
-        f_b = torch.index_select(cb_b, 0, idx_b)
+    # [FIX] Correctly separate RGB channels for any SH degree
+    n_rest = rest.shape[1]
+    if n_rest % 3 != 0:
+        raise ValueError(f"Rest coeffs {n_rest} not divisible by 3")
+    n_coeffs = n_rest // 3
 
-        # DC: [N, 1, 3]
-        dc = torch.stack([f_r[:, 0], f_g[:, 0], f_b[:, 0]], dim=1).unsqueeze(1)
+    # Reshape from Interleaved [N, 3*C] to [N, C, 3]
+    rest_reshaped = rest.reshape(N, n_coeffs, 3)
+    rest_r = rest_reshaped[:, :, 0]
+    rest_g = rest_reshaped[:, :, 1]
+    rest_b = rest_reshaped[:, :, 2]
 
-        # Rest: [N, Coeffs, 3]
-        if f_r.shape[1] > 1:
-            rest_r = f_r[:, 1:]  # Band 1 RGB
-            rest_g = f_g[:, 1:]  # Band 2 RGB
-            rest_b = f_b[:, 1:]  # Band 3 RGB
+    # Concatenate DC + Rest per channel
+    r = np.concatenate([dc[:, 0:1], rest_r], axis=1)
+    g = np.concatenate([dc[:, 1:2], rest_g], axis=1)
+    b = np.concatenate([dc[:, 2:3], rest_b], axis=1)
 
-            # --- 关键修改: dim=1 ---
-            # 这样 features_rest[0, 0, :] 就是 rest_r[0] (即 R1, G1, B1)
-            # 这才是正确的 "Coefficient 1"
-            features_rest = torch.stack([rest_r, rest_g, rest_b], dim=1)
-        else:
-            features_rest = torch.zeros((xyz.shape[0], 0, 3), device=device)
+    print(f"[ENC] Channel dim: {r.shape[1]}")
 
-        gaussians._xyz = xyz
-        gaussians._features_dc = dc
-        gaussians._features_rest = features_rest
-        gaussians._opacity = opacity
-        gaussians._scaling = scale
-        gaussians._rotation = rot
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA not available but --device=cuda was set.")
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-        image = render_pkg["render"]
-        gt_image = viewpoint_cam.original_image.cuda()
+    print(f"[ENC] train codebook K={args.K} sample={args.sample} iters={args.kmeans_iters} dev={args.device}")
+    cb_r, idx_r = build_codebook(r, args.K, args.sample, args.kmeans_iters, args.device, seed=0)
+    cb_g, idx_g = build_codebook(g, args.K, args.sample, args.kmeans_iters, args.device, seed=1)
+    cb_b, idx_b = build_codebook(b, args.K, args.sample, args.kmeans_iters, args.device, seed=2)
 
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image.unsqueeze(0), gt_image.unsqueeze(0)))
+    pos16 = pos.astype(np.float16)
+    nrm16 = nrm.astype(np.float16)
+    op_q, op_mn, op_mx, op_bits = quant_minmax(opacity, bits=8)
+    sc_q, sc_mn, sc_mx, sc_bits = quant_minmax(scale, bits=8)
+    rot_q, rot_bits = quant_quat(rot, bits=args.rot_bits)
 
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+    perm = np.arange(N, dtype=np.int64) if args.no_morton else morton_sort(pos.astype(np.float32), bits=10)
 
-        if iteration % 100 == 0:
-            pbar.set_postfix({"Loss": f"{loss.item():.5f}"})
+    def ap(x):
+        return x[perm]
 
-    print(f"[FT] Saving finetuned model to {args.save_path}...")
-
-    new_cb_r = cb_r.detach().cpu().numpy().astype(np.float16)
-    new_cb_g = cb_g.detach().cpu().numpy().astype(np.float16)
-    new_cb_b = cb_b.detach().cpu().numpy().astype(np.float16)
-
-    new_op = opacity.detach().clamp(0, 1)
-    new_op_val = new_op.cpu().numpy()
-    op_mn_new = new_op_val.min()
-    op_mx_new = new_op_val.max()
-    span = max(op_mx_new - op_mn_new, 1e-9)
-    new_op_q = np.round((new_op_val - op_mn_new) / span * 255.0).astype(np.uint8)
-
+    out_npz = os.path.join(iter_dir, f"point_cloud.{args.tag}.npz")
     np.savez_compressed(
-        args.save_path,
-        degree=data["degree"],
-        K=data["K"],
-        morton_used=data["morton_used"],
-        idx_r=data["idx_r"], idx_g=data["idx_g"], idx_b=data["idx_b"],
-        pos16=data["pos16"],
-        nrm16=data["nrm16"] if "nrm16" in data else None,
-        sc_q=data["sc_q"], sc_mn=data["sc_mn"], sc_mx=data["sc_mx"], sc_bits=data["sc_bits"],
-        rot_q=data["rot_q"], rot_bits=data["rot_bits"],
-        cb_r=new_cb_r, cb_g=new_cb_g, cb_b=new_cb_b,
-        op_q=new_op_q, op_mn=op_mn_new.astype(np.float32), op_mx=op_mx_new.astype(np.float32), op_bits=data["op_bits"]
+        out_npz,
+        degree=np.int32(1),
+        K=np.int32(args.K),
+        morton_used=np.int32(0 if args.no_morton else 1),
+        cb_r=cb_r, cb_g=cb_g, cb_b=cb_b,
+        idx_r=ap(idx_r), idx_g=ap(idx_g), idx_b=ap(idx_b),
+        pos16=ap(pos16),
+        nrm16=ap(nrm16),
+        op_q=ap(op_q), op_mn=op_mn, op_mx=op_mx, op_bits=op_bits,
+        sc_q=ap(sc_q), sc_mn=sc_mn, sc_mx=sc_mx, sc_bits=sc_bits,
+        rot_q=ap(rot_q), rot_bits=rot_bits,
     )
-    print("[FT] Done.")
+
+    orig = os.path.getsize(ply_path)
+    comp = os.path.getsize(out_npz)
+    print(f"[ENC] saved npz   = {out_npz}")
+    print(f"[ENC] ply size    = {orig / 1024 / 1024:.2f} MB")
+    print(f"[ENC] npz size    = {comp / 1024 / 1024:.2f} MB  (ratio {orig / comp:.2f}x)")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--tag", required=True)
-    parser.add_argument("--save_path", default=None)
-    parser.add_argument("--finetune_iters", type=int, default=2000)
-    parser.add_argument("--iteration", type=int, default=30000)
-
-    lp = ModelParams(parser)
-    op = OptimizationParams(parser)
-    pp = PipelineParams(parser)
-
-    args = parser.parse_args()
-
-    if not args.model_path:
-        parser.error("argument --model_path/-m is required")
-    if not args.source_path:
-        parser.error("argument --source_path/-s is required")
-
-    if args.save_path is None:
-        args.save_path = os.path.join(args.model_path, "point_cloud", f"iteration_{args.iteration}",
-                                      f"point_cloud.{args.tag}.finetuned.npz")
-
-    finetune(lp.extract(args), op.extract(args), pp.extract(args), args)
+    main()
