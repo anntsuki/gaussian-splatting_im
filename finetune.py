@@ -121,12 +121,15 @@ if __name__ == "__main__":
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    parser.add_argument("--iterations", type=int, default=3000, help="Number of fine-tuning iterations")
+
+    # === 修复点：删除下面这行，因为 OptimizationParams 已经定义了它 ===
+    # parser.add_argument("--iterations", type=int, default=3000, help="Number of fine-tuning iterations")
+
     parser.add_argument("--start_checkpoint", type=str, required=True, help="Path to your distilled .ply file")
 
     args = parser.parse_args(sys.argv[1:])
 
-    # 这里的 model_path 是为了输出目录用，随便起个名字
+    # 这里的 model_path 是为了输出目录用
     if not args.model_path:
         args.model_path = "finetuned_output"
 
