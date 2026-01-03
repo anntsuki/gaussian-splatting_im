@@ -156,7 +156,7 @@ def finetune(dataset, opt, pipe, args):
         gt_image = viewpoint_cam.original_image.cuda()
 
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image.unsqueeze(0), gt_image.unsqueeze(0)))
 
         loss.backward()
         optimizer.step()
