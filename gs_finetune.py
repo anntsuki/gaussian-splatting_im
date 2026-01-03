@@ -73,7 +73,7 @@ def finetune(dataset, opt, pipe, args):
 
     device = "cuda"
 
-    # [FIX] Force Float32 for renderer compatibility
+    # Force Float32 for renderer compatibility
     cb_r = nn.Parameter(torch.from_numpy(data["cb_r"]).to(device).float().requires_grad_(True))
     cb_g = nn.Parameter(torch.from_numpy(data["cb_g"]).to(device).float().requires_grad_(True))
     cb_b = nn.Parameter(torch.from_numpy(data["cb_b"]).to(device).float().requires_grad_(True))
@@ -137,7 +137,7 @@ def finetune(dataset, opt, pipe, args):
             rest_g = f_g[:, 1:]
             rest_b = f_b[:, 1:]
 
-            # [FIX] Stack along last dim to get [N, Coeffs, 3(RGB)]
+            # Stack along last dim to get [N, Coeffs, 3(RGB)]
             features_rest = torch.stack([rest_r, rest_g, rest_b], dim=-1)
         else:
             features_rest = torch.zeros((xyz.shape[0], 0, 3), device=device)
@@ -153,7 +153,7 @@ def finetune(dataset, opt, pipe, args):
         image = render_pkg["render"]
         gt_image = viewpoint_cam.original_image.cuda()
 
-        # [FIX] Unsqueeze for SSIM batch dimension
+        # Unsqueeze for SSIM batch dimension
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (
                     1.0 - ssim(image.unsqueeze(0), gt_image.unsqueeze(0)))
@@ -171,11 +171,15 @@ def finetune(dataset, opt, pipe, args):
     new_cb_g = cb_g.detach().cpu().numpy().astype(np.float16)
     new_cb_b = cb_b.detach().cpu().numpy().astype(np.float16)
 
-    new_op = opacity.detach().clamp(0, 1)
+    # [FIX] Do NOT clamp opacity logits to [0,1]. Just detach.
+    # We rely on min/max quantization to handle the range.
+    new_op = opacity.detach()
+
     new_op_val = new_op.cpu().numpy()
     op_mn_new = new_op_val.min()
     op_mx_new = new_op_val.max()
     span = max(op_mx_new - op_mn_new, 1e-9)
+    # Re-quantize to 8-bit based on the new optimized range
     new_op_q = np.round((new_op_val - op_mn_new) / span * 255.0).astype(np.uint8)
 
     np.savez_compressed(
@@ -196,7 +200,6 @@ def finetune(dataset, opt, pipe, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # [FIX] Removed conflicting arguments, let ModelParams handle them
     parser.add_argument("--tag", required=True)
     parser.add_argument("--save_path", default=None)
     parser.add_argument("--finetune_iters", type=int, default=2000)
