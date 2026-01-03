@@ -19,9 +19,17 @@ def training(dataset, opt, pipe, args):
     lpips_fn = lpips.LPIPS(net='vgg').cuda()
 
     # 2. 初始化高斯模型，注意这里的 sh_degree 要和你蒸馏后的模型一致 (SH2 则为 2)
-    gaussians = GaussianModel(dataset.sh_degree)
 
     # 3. 初始化场景
+    lpips_fn = lpips.LPIPS(net='vgg').cuda()
+    gaussians = GaussianModel(dataset.sh_degree)
+
+    # === 【新增】手动创建输出目录，防止报错 ===
+    import os
+    os.makedirs(args.model_path, exist_ok=True)
+    # =======================================
+
+    # 这里的 load_iteration=0 保持不变
     scene = Scene(dataset, gaussians, load_iteration=0, shuffle=False)
 
     # === 关键步骤：加载你已经压缩/蒸馏好的 PLY 文件 ===
