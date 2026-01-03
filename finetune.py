@@ -22,7 +22,7 @@ def training(dataset, opt, pipe, args):
     gaussians = GaussianModel(dataset.sh_degree)
 
     # 3. 初始化场景
-    scene = Scene(dataset, gaussians, load_iteration=-1, shuffle=False)
+    scene = Scene(dataset, gaussians, load_iteration=0, shuffle=False)
 
     # === 关键步骤：加载你已经压缩/蒸馏好的 PLY 文件 ===
     if args.start_checkpoint:
