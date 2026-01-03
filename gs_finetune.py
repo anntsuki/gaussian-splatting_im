@@ -91,53 +91,38 @@ def finetune(dataset, opt, pipe, args):
 
     pbar = tqdm(range(args.finetune_iters), desc="Codebook Finetuning")
 
+    # ------------------ 替换开始 ------------------
     for iteration in pbar:
-        # 随机选相机
-        viewpoint_cam = scene.getTrainCameras()[randint(0, len(scene.getTrainCameras()) - 1)]
+        try:
+            viewpoint_cam = scene.getTrainCameras()[randint(0, len(scene.getTrainCameras()) - 1)]
+        except:
+            viewpoint_cam = scene.getTrainCameras()[0]
 
-        # --- 动态构建特征 (On-the-fly Dequantization) ---
-        # 查表得到 RGB 特征向量
+        # --- On-the-fly Decoding ---
         f_r = torch.index_select(cb_r, 0, idx_r)
         f_g = torch.index_select(cb_g, 0, idx_g)
         f_b = torch.index_select(cb_b, 0, idx_b)
 
-        # 拼装回 GaussianModel 需要的格式
-        # 假设 Encode 时结构是 [DC(1), Rest(N)]
-        # R=[dc_r, rest_r...], G=[dc_g, rest_g...], B=[dc_b, rest_b...]
+        # 组装 DC: [N, 1, 3]  <-- 这是一个 3维张量
+        dc = torch.stack([f_r[:, 0], f_g[:, 0], f_b[:, 0]], dim=1).unsqueeze(1)
 
-        # 提取 DC
-        dc = torch.stack([f_r[:, 0], f_g[:, 0], f_b[:, 0]], dim=1).unsqueeze(1)  # [N, 1, 3]
-
-        # 提取 Rest (如果有)
+        # 组装 Rest: 必须也是 3维张量 [N, Coeffs, 3]
         if f_r.shape[1] > 1:
-            # 拼装顺序需要匹配 gs_decode 的逻辑
-            # gs_decode: rest = concat([r[:,1:], g[:,1:], b[:,1:]])
-            # 我们这里还原成 [N, C, 1] 还是 [N, Total] ?
-            # 3DGS render 里的 features_rest 通常是 [N, 15] (SH2) 或 [N, 9] (SH1)
-            # 我们需要按照 "R的所有系数, G的所有系数, B的所有系数" 还是 "Coeff0_RGB, Coeff1_RGB..."?
-            # 之前的 gs_encode/decode 逻辑是将 R/G/B 分开存。
-            # 只要 gs_decode 读取顺序和这里拼装顺序一致，渲染就没问题。
-            # 为了让标准 render 跑通，我们需要看 render 期待什么。
-            # render 期待 features_rest 为 (N, (deg+1)^2-1, 3) ? 不，是 (N, 3 * n_coeffs) ?
-            # 实际上 GaussianModel 存储的是 (N, n_features).
-            # 让我们直接hack gaussians对象
+            rest_r = f_r[:, 1:]  # [N, C]
+            rest_g = f_g[:, 1:]  # [N, C]
+            rest_b = f_b[:, 1:]  # [N, C]
 
-            # 构造 Rest: [N, 3 * (D-1)]
-            rest_r = f_r[:, 1:]
-            rest_g = f_g[:, 1:]
-            rest_b = f_b[:, 1:]
-            # 简单拼接，只要维度对上，优化器会自动调整值去适应
-            features_rest = torch.cat([rest_r, rest_g, rest_b], dim=1)
-            # 注意：标准的 features_rest 形状通常需要 reshape，
-            # 但既然我们是从零训练 codebook，只要映射关系固定，网络学会什么就是什么。
-            # 唯一风险是如果 sh_degree > 0，renderer 会用球谐函数乘这些系数。
+            # === 关键修改点 ===
+            # 不要用 cat(dim=1) 变成 [N, 3*C]，而是用 stack(dim=-1) 变成 [N, C, 3]
+            features_rest = torch.stack([rest_r, rest_g, rest_b], dim=-1)
         else:
-            features_rest = torch.zeros((xyz.shape[0], 0), device=device)
+            # 如果没有 rest，也要保证是 3维的空张量 [N, 0, 3]
+            features_rest = torch.zeros((xyz.shape[0], 0, 3), device=device)
 
-        # 赋值给 gaussians 对象 (Hack)
+        # 赋值给 GaussianModel (不要 view Flatten!)
         gaussians._xyz = xyz
         gaussians._features_dc = dc
-        gaussians._features_rest = features_rest.view(xyz.shape[0], -1)  # Flatten
+        gaussians._features_rest = features_rest  # 直接赋值 3D 张量
         gaussians._opacity = opacity
         gaussians._scaling = scale
         gaussians._rotation = rot
@@ -147,19 +132,17 @@ def finetune(dataset, opt, pipe, args):
         image = render_pkg["render"]
         gt_image = viewpoint_cam.original_image.cuda()
 
-        # Loss
+        # Loss (L1 + SSIM)
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
-        # Backward
         loss.backward()
-
-        # Step
         optimizer.step()
         optimizer.zero_grad()
 
         if iteration % 100 == 0:
             pbar.set_postfix({"Loss": f"{loss.item():.5f}"})
+    # ------------------ 替换结束 ------------------
 
     # 6. 保存微调结果
     print(f"[FT] Saving finetuned model to {args.save_path}...")
