@@ -1,6 +1,6 @@
 import os, re, glob, json, subprocess, sys
 from datetime import datetime
-input_root  = "/root/autodl-tmp/gaussian-splatting_feature-pruning/eval_sh2pv"
+input_root  = "/root/autodl-tmp/gaussian-splatting_feature-pruning/eval_line2_sh2pv"
 output_root = "/root/autodl-tmp/gaussian-splatting_feature-pruning/eval_sh2pvfine"
 
 path_360   = "/root/autodl-tmp/gaussian-splatting/assets/360_v2"
